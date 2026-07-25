@@ -77,7 +77,7 @@ public class XsdController {
             response.put("fileName", parsed.fileName());
             response.put("roots", parsed.roots());
             response.put("rootCount", parsed.roots().size());
-            response.put("buildId", "2026-07-25d");
+            response.put("buildId", "2026-07-25e");
             if (!parsed.roots().isEmpty()) {
                 var doc = parsed.roots().stream()
                         .filter(r -> "Document".equals(r.getName()))
@@ -193,6 +193,7 @@ public class XsdController {
     private Map<String, Object> validationError(XmlValidationException ex) {
         Map<String, Object> body = error(ex.getMessage());
         body.put("errors", ex.getErrors());
+        body.put("buildId", "2026-07-25e");
         return body;
     }
 

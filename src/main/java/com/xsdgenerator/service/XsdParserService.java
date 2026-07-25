@@ -228,7 +228,8 @@ public class XsdParserService {
 
         // Empty <Document/> against pacs.008 — rebuild the tree and fill from scratch once
         if (!errors.isEmpty() && isMissingDocumentMessage(errors)) {
-            log.warn("Document missing FIToFICstmrCdtTrf — forcing schema rematerialize and refill");
+            log.warn("Document missing FIToFICstmrCdtTrf — forcing schema rematerialize and refill. xmlHead={}",
+                    xml.length() > 200 ? xml.substring(0, 200).replace('\n', ' ') : xml.replace('\n', ' '));
             rootSchema = forceRematerializeRoot(schemaId, stored, rootSchema);
             rootSchema = ensureIsoMessageChild(schemaId, stored, rootSchema);
             Map<String, Object> fresh = new LinkedHashMap<>();
@@ -250,9 +251,16 @@ public class XsdParserService {
         }
 
         if (!errors.isEmpty()) {
+            // Include a short XML preview so UI/logs show what failed validation
+            List<String> withPreview = new ArrayList<>(errors);
+            String preview = xml == null ? "" : xml.replace('\n', ' ').trim();
+            if (preview.length() > 280) {
+                preview = preview.substring(0, 280) + "...";
+            }
+            withPreview.add("generatedXmlPreview: " + preview);
             throw new XmlValidationException(
                     "Generated XML is not valid against the uploaded XSD (" + errors.size() + " error(s))",
-                    errors);
+                    withPreview);
         }
         return xml;
     }

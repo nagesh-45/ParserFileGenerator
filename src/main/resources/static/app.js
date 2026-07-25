@@ -1133,18 +1133,29 @@
         if (synthesized != null) return synthesized;
 
         // Country / currency / BIC / IBAN shortcuts
-        if (/^\[A-Z\]\{2(?:,2)?\}$/.test(p)) return pick(['US', 'GB', 'DE', 'FR', 'IN', 'NL', 'IE', 'CH']);
-        if (/^\[A-Z\]\{3(?:,3)?\}$/.test(p)) return pick(['USD', 'EUR', 'GBP', 'INR', 'CHF', 'JPY']);
+        if (/^\[A-Z\]\{2(?:,2)?\}$/.test(p)) return getCountryCode() || pick(['US', 'GB', 'DE', 'FR', 'IN', 'NL', 'IE', 'CH']);
+        if (/^\[A-Z\]\{3(?:,3)?\}$/.test(p)) {
+            const c = getCountryCode();
+            return (c && COUNTRY_CURRENCIES[c]) || pick(['USD', 'EUR', 'GBP', 'INR', 'CHF', 'JPY']);
+        }
         // UETR / UUID v4 used by pacs.008
         if (/\[a-f0-9\]\{8\}-\[a-f0-9\]\{4\}-4\[a-f0-9\]/.test(p) || /uuid|uetr/i.test(field.typeName || '') || /^uetr$/i.test(field.name || '')) {
             const h = () => 'xxxxxxxx'.replace(/x/g, () => pick('abcdef0123456789'.split('')));
             return `${h().slice(0,8)}-${h().slice(0,4)}-4${h().slice(0,3)}-${pick(['8','9','a','b'])}${h().slice(0,3)}-${h()}${h().slice(0,4)}`;
         }
+        // BIC / BICFI (ISO 20022) — 8 or 11 chars
+        if (/\[A-Z0-9\]\{4,4\}\[A-Z\]\{2,2\}\[A-Z0-9\]\{2,2\}/.test(p)
+            || /bicfi|bic/i.test(field.typeName || '')
+            || /^(bicfi|bic)$/i.test(field.name || '')) {
+            return pick(['CHASUS33XXX', 'COBADEFFXXX', 'DEUTDEFFXXX', 'HSBCHKHHXXX', 'BNPAFRPPXXX']);
+        }
         if (/\[A-Z\]\{6,6\}\[A-Z2-9\]/.test(p)) {
             return pick(['CHASUS33', 'DEUTDEFF', 'BNPAFRPP', 'BARCGB22', 'HDFCINBB']);
         }
-        if (/\[A-Z\]\{2,2\}\[0-9\]\{2,2\}\[a-zA-Z0-9\]/.test(p)) {
-            return pick(['GB82WEST12345698765432', 'DE89370400440532013000']);
+        if (/\[A-Z\]\{2,2\}\[0-9\]\{2,2\}\[a-zA-Z0-9\]/.test(p)
+            || /iban/i.test(field.typeName || '')
+            || /^iban$/i.test(field.name || '')) {
+            return pick(['GB82WEST12345698765432', 'DE89370400440532013000', 'FR1420041010050500013M02606']);
         }
         if (/phone|PhoneNumber/i.test(field.typeName || '') || (/\\\+\[0-9\]\{1,3\}/.test(p) && p.includes('-'))) {
             return '+1-5551234567';

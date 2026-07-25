@@ -203,7 +203,8 @@ public class XsdParserService {
     public String generateAndValidateXml(String schemaId, SchemaField clientSchema, Map<String, Object> values) {
         StoredSchema stored = requireStoredSchema(schemaId);
         SchemaField rootSchema = resolveRootSchema(stored, clientSchema);
-        String xml = generateXml(rootSchema, values);
+        Map<String, Object> enriched = enrichValuesForGeneration(rootSchema, values);
+        String xml = generateXml(rootSchema, enriched);
         validateXmlAgainstXsd(xml, stored);
         return xml;
     }
@@ -475,6 +476,204 @@ public class XsdParserService {
             return map.isEmpty() && !field.isRequired();
         }
         return false;
+    }
+
+    /**
+     * Fills missing required elements/attributes before DOM build so incomplete form posts
+     * (common with large pacs.008 trees) still produce XSD-valid XML where possible.
+     */
+    private Map<String, Object> enrichValuesForGeneration(SchemaField root, Map<String, Object> values) {
+        Map<String, Object> out = values != null ? new LinkedHashMap<>(values) : new LinkedHashMap<>();
+        Object current = out.containsKey(root.getName()) ? out.get(root.getName()) : out;
+        Object enriched = enrichNode(root, current);
+        out.put(root.getName(), enriched);
+        return out;
+    }
+
+    private Object enrichNode(SchemaField field, Object value) {
+        if (field.isAttribute()) {
+            if (value == null || String.valueOf(value).isBlank()) {
+                return field.isRequired() ? defaultLexicalValue(field) : value;
+            }
+            return value;
+        }
+
+        if (!field.isComplex()) {
+            Map<String, Object> valueMap = asMap(value);
+            boolean hasAttrs = field.getAttributes() != null && !field.getAttributes().isEmpty();
+            if (valueMap != null || hasAttrs) {
+                Map<String, Object> wrap = valueMap != null ? new LinkedHashMap<>(valueMap) : new LinkedHashMap<>();
+                Object text = wrap.containsKey("_text") ? wrap.get("_text") : (valueMap == null ? value : null);
+                if (text == null || String.valueOf(text).isBlank()) {
+                    text = defaultLexicalValue(field);
+                }
+                wrap.put("_text", text);
+                Map<String, Object> attrs = asMap(wrap.get("_attrs"));
+                attrs = attrs != null ? new LinkedHashMap<>(attrs) : new LinkedHashMap<>();
+                if (field.getAttributes() != null) {
+                    for (SchemaField attr : field.getAttributes()) {
+                        Object av = attrs.get(attr.getName());
+                        if ((av == null || String.valueOf(av).isBlank())
+                                && (attr.isRequired() || "Ccy".equals(attr.getName()))) {
+                            attrs.put(attr.getName(), defaultLexicalValue(attr));
+                        }
+                    }
+                }
+                if (!attrs.isEmpty()) {
+                    wrap.put("_attrs", attrs);
+                }
+                return wrap;
+            }
+            if (value == null || String.valueOf(value).isBlank()) {
+                return field.isRequired() ? defaultLexicalValue(field) : value;
+            }
+            return value;
+        }
+
+        Map<String, Object> map = asMap(value);
+        map = map != null ? new LinkedHashMap<>(map) : new LinkedHashMap<>();
+
+        List<SchemaField> selected = selectChildrenForEnrichment(field.getChildren(), map);
+        for (SchemaField child : selected) {
+            boolean must = child.isRequired() || map.containsKey(child.getName());
+            if (!must) {
+                continue;
+            }
+            Object childVal = map.get(child.getName());
+            boolean repeatable = child.getMaxOccurs() == -1 || child.getMaxOccurs() > 1;
+            if (repeatable) {
+                if (childVal instanceof List<?> list) {
+                    List<Object> enrichedList = new ArrayList<>();
+                    for (Object item : list) {
+                        enrichedList.add(enrichNode(child, item));
+                    }
+                    if (enrichedList.isEmpty() && child.isRequired()) {
+                        enrichedList.add(enrichNode(child, null));
+                    }
+                    map.put(child.getName(), enrichedList);
+                } else if (childVal != null) {
+                    map.put(child.getName(), List.of(enrichNode(child, childVal)));
+                } else if (child.isRequired()) {
+                    map.put(child.getName(), List.of(enrichNode(child, null)));
+                }
+            } else {
+                map.put(child.getName(), enrichNode(child, childVal));
+            }
+        }
+        return map;
+    }
+
+    private List<SchemaField> selectChildrenForEnrichment(List<SchemaField> children, Map<String, Object> values) {
+        if (children == null || children.isEmpty()) {
+            return List.of();
+        }
+        Map<String, Integer> chosen = new LinkedHashMap<>();
+        for (SchemaField child : children) {
+            if (child.getChoiceGroup() == null) {
+                continue;
+            }
+            Object v = values.get(child.getName());
+            if (!shouldOmit(child, v) && !chosen.containsKey(child.getChoiceGroup())) {
+                chosen.put(child.getChoiceGroup(), child.getChoiceBranch() != null ? child.getChoiceBranch() : 0);
+            }
+        }
+        for (SchemaField child : children) {
+            if (child.getChoiceGroup() == null) {
+                continue;
+            }
+            chosen.putIfAbsent(child.getChoiceGroup(), child.getChoiceBranch() != null ? child.getChoiceBranch() : 0);
+        }
+
+        List<SchemaField> selected = new ArrayList<>();
+        for (SchemaField child : children) {
+            if (child.getChoiceGroup() == null) {
+                selected.add(child);
+                continue;
+            }
+            Integer branch = child.getChoiceBranch() != null ? child.getChoiceBranch() : 0;
+            if (branch.equals(chosen.get(child.getChoiceGroup()))) {
+                selected.add(child);
+            }
+        }
+        return selected;
+    }
+
+    private String defaultLexicalValue(SchemaField field) {
+        String name = field.getName() != null ? field.getName() : "";
+        String typeName = field.getTypeName() != null ? field.getTypeName() : "";
+        String type = field.getType() != null ? field.getType() : "string";
+
+        if (field.getEnumerations() != null && !field.getEnumerations().isEmpty()) {
+            return field.getEnumerations().get(0);
+        }
+        if ("Ccy".equalsIgnoreCase(name) || typeName.toLowerCase(Locale.ROOT).contains("currency")) {
+            return "USD";
+        }
+        if ("Ctry".equalsIgnoreCase(name) || "CtryOfRes".equalsIgnoreCase(name)
+                || typeName.toLowerCase(Locale.ROOT).contains("country")) {
+            return "US";
+        }
+        if ("BICFI".equalsIgnoreCase(name) || "BIC".equalsIgnoreCase(name)
+                || typeName.toUpperCase(Locale.ROOT).contains("BIC")) {
+            return "CHASUS33XXX";
+        }
+        if ("IBAN".equalsIgnoreCase(name) || typeName.toUpperCase(Locale.ROOT).contains("IBAN")) {
+            return "DE89370400440532013000";
+        }
+        if ("UETR".equalsIgnoreCase(name) || typeName.toLowerCase(Locale.ROOT).contains("uuid")) {
+            return "a1b2c3d4-e5f6-4789-8abc-def012345678";
+        }
+        if ("NbOfTxs".equalsIgnoreCase(name)) {
+            return "1";
+        }
+        if ("SttlmMtd".equalsIgnoreCase(name)) {
+            return "CLRG";
+        }
+        if ("ChrgBr".equalsIgnoreCase(name)) {
+            return "SHAR";
+        }
+        if (field.getPattern() != null && !field.getPattern().isBlank()) {
+            String p = field.getPattern();
+            if (p.contains("[A-Z]{3")) {
+                return "USD";
+            }
+            if (p.contains("[A-Z]{2")) {
+                return "US";
+            }
+            if (p.toLowerCase(Locale.ROOT).contains("a-f0-9") && p.contains("-4")) {
+                return "a1b2c3d4-e5f6-4789-8abc-def012345678";
+            }
+            if (p.contains("[0-9]")) {
+                return "1";
+            }
+        }
+        return switch (type) {
+            case "boolean" -> "true";
+            case "integer" -> "1";
+            case "decimal" -> field.getFractionDigits() != null && field.getFractionDigits() > 0
+                    ? "1." + "0".repeat(Math.min(field.getFractionDigits(), 5))
+                    : "1.00";
+            case "date" -> java.time.LocalDate.now().toString();
+            case "dateTime" -> java.time.LocalDateTime.now().withNano(0).toString();
+            case "time" -> "12:00:00";
+            case "gYearMonth" -> java.time.YearMonth.now().toString();
+            case "gYear" -> String.valueOf(java.time.Year.now().getValue());
+            default -> {
+                int max = field.getLength() != null ? field.getLength()
+                        : (field.getMaxLength() != null ? Math.min(field.getMaxLength(), 16) : 8);
+                int min = field.getMinLength() != null ? field.getMinLength() : 1;
+                int len = Math.max(min, Math.min(max, 8));
+                String base = name.replaceAll("[^A-Za-z0-9]", "");
+                if (base.isBlank()) {
+                    base = "VAL";
+                }
+                StringBuilder sb = new StringBuilder(base);
+                while (sb.length() < len) {
+                    sb.append('X');
+                }
+                yield sb.substring(0, Math.min(len, sb.length()));
+            }
+        };
     }
 
     private Map<String, Object> asMap(Object value) {

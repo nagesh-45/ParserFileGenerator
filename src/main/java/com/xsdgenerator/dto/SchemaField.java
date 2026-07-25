@@ -46,6 +46,12 @@ public class SchemaField {
      */
     private Integer choiceBranch;
 
+    /**
+     * When true, this field is part of an xs:choice that itself has minOccurs &gt;= 1,
+     * so exactly one branch must appear in the XML.
+     */
+    private boolean choiceMandatory;
+
     public SchemaField() {
     }
 
@@ -236,6 +242,14 @@ public class SchemaField {
 
     public void setChoiceBranch(Integer choiceBranch) {
         this.choiceBranch = choiceBranch;
+    }
+
+    public boolean isChoiceMandatory() {
+        return choiceMandatory;
+    }
+
+    public void setChoiceMandatory(boolean choiceMandatory) {
+        this.choiceMandatory = choiceMandatory;
     }
 
     public boolean isUnbounded() {

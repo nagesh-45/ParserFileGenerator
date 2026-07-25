@@ -535,10 +535,10 @@ public class XsdParserService {
 
         List<SchemaField> selected = selectChildrenForEnrichment(field.getChildren(), map);
         for (SchemaField child : selected) {
-            // xs:choice alternatives are marked required=false, but the chosen branch must still be emitted
+            // xs:choice alternatives are marked required=false; only force-fill when the choice itself is mandatory
             boolean must = child.isRequired()
                     || map.containsKey(child.getName())
-                    || child.getChoiceGroup() != null;
+                    || (child.getChoiceGroup() != null && child.isChoiceMandatory());
             if (!must) {
                 continue;
             }
@@ -1012,6 +1012,7 @@ public class XsdParserService {
             String groupId = isChoice
                     ? (choiceGroup != null ? choiceGroup : "choice-" + choiceCounter.incrementAndGet())
                     : choiceGroup;
+            boolean choiceMandatory = isChoice && particle.getMinOccurs() >= 1;
 
             XSObjectList particles = group.getParticles();
             for (int i = 0; i < particles.getLength(); i++) {
@@ -1021,6 +1022,7 @@ public class XsdParserService {
                     for (SchemaField bf : mapped) {
                         bf.setChoiceGroup(groupId);
                         bf.setChoiceBranch(i);
+                        bf.setChoiceMandatory(choiceMandatory);
                         // Alternatives are mutually exclusive — don't mark all as HTML-required
                         bf.setRequired(false);
                     }

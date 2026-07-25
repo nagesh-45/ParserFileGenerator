@@ -82,7 +82,9 @@ public class XsdController {
             return ResponseEntity.badRequest().body(error(ex.getMessage()));
         } catch (Exception ex) {
             return ResponseEntity.internalServerError()
-                    .body(error("Failed to parse XSD: " + ex.getMessage()));
+                    .body(error("Failed to parse XSD: " + ex.getMessage()
+                            + (ex.getCause() != null && ex.getCause().getMessage() != null
+                            ? " (" + ex.getCause().getMessage() + ")" : "")));
         }
     }
 

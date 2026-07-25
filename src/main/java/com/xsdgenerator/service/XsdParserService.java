@@ -91,6 +91,7 @@ public class XsdParserService {
         if (uploadBytes == null || uploadBytes.length == 0) {
             throw new IllegalArgumentException("XSD file is empty");
         }
+        uploadBytes = stripBom(uploadBytes);
         String safeName = sanitizeFileName(fileName);
         Map<String, byte[]> files = new LinkedHashMap<>();
         String primaryName;
@@ -108,6 +109,12 @@ public class XsdParserService {
                         : safeName + ".xsd";
                 files.put(primaryName, uploadBytes.clone());
             }
+            // Normalize companion bytes (BOM)
+            Map<String, byte[]> normalized = new LinkedHashMap<>();
+            for (Map.Entry<String, byte[]> e : files.entrySet()) {
+                normalized.put(e.getKey(), stripBom(e.getValue()));
+            }
+            files = normalized;
         } catch (IllegalArgumentException ex) {
             throw ex;
         } catch (Exception ex) {
@@ -132,6 +139,19 @@ public class XsdParserService {
         log.info("Stored XSD '{}' ({} companion file(s)) under schemaId={}, roots={}",
                 primaryName, files.size(), schemaId, roots.size());
         return new ParsedSchema(schemaId, primaryName, roots);
+    }
+
+    private byte[] stripBom(byte[] bytes) {
+        if (bytes == null || bytes.length < 3) {
+            return bytes;
+        }
+        // UTF-8 BOM
+        if ((bytes[0] & 0xFF) == 0xEF && (bytes[1] & 0xFF) == 0xBB && (bytes[2] & 0xFF) == 0xBF) {
+            byte[] out = new byte[bytes.length - 3];
+            System.arraycopy(bytes, 3, out, 0, out.length);
+            return out;
+        }
+        return bytes;
     }
 
     public List<SchemaField> parseXsd(byte[] xsdBytes, String fileName) {
@@ -484,47 +504,66 @@ public class XsdParserService {
     }
 
     private XSModel loadSchemaModel(byte[] xsdBytes, String fileName, Map<String, byte[]> companions) {
+        List<String> loadErrors = new ArrayList<>();
         XMLSchemaLoader loader = new XMLSchemaLoader();
         loader.setEntityResolver(new MapXmlEntityResolver(companions != null ? companions : Map.of(), fileName));
-        LSInput input = new ByteArrayLSInput(xsdBytes, sanitizeFileName(fileName));
-        XSModel model = loader.load(input);
+        loader.setErrorHandler(new CollectingXniErrorHandler(loadErrors));
+
+        Map<String, byte[]> all = new LinkedHashMap<>();
+        if (companions != null && !companions.isEmpty()) {
+            all.putAll(companions);
+        } else {
+            all.put(sanitizeFileName(fileName), xsdBytes);
+        }
+
+        // Prefer on-disk load — more reliable for large ISO 20022 XSDs than in-memory LSInput
+        XSModel model = loadFromTempDirectory(loader, all, fileName);
         if (model == null) {
-            try {
-                java.nio.file.Path tempDir = java.nio.file.Files.createTempDirectory("xsd-upload-");
-                try {
-                    Map<String, byte[]> all = companions != null ? companions : Map.of(sanitizeFileName(fileName), xsdBytes);
-                    for (Map.Entry<String, byte[]> e : all.entrySet()) {
-                        java.nio.file.Path out = tempDir.resolve(sanitizeFileName(e.getKey()));
-                        java.nio.file.Files.write(out, e.getValue());
-                    }
-                    java.nio.file.Path primary = tempDir.resolve(sanitizeFileName(fileName));
-                    if (!java.nio.file.Files.exists(primary)) {
-                        primary = tempDir.resolve(sanitizeFileName(choosePrimarySchema(all)));
-                    }
-                    model = loader.loadURI(primary.toUri().toString());
-                } finally {
-                    try (var paths = java.nio.file.Files.walk(tempDir)) {
-                        paths.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
-                            try {
-                                java.nio.file.Files.deleteIfExists(p);
-                            } catch (Exception ignored) {
-                            }
-                        });
-                    }
-                }
-            } catch (Exception ex) {
-                throw new IllegalArgumentException(
-                        "Unable to load XSD schema. For pacs.008 upload the message XSD, "
-                                + "or a ZIP containing it plus any imported XSDs. Detail: " + ex.getMessage(),
-                        ex);
-            }
+            LSInput input = new ByteArrayLSInput(xsdBytes, sanitizeFileName(fileName));
+            model = loader.load(input);
         }
         if (model == null) {
+            String detail = loadErrors.isEmpty()
+                    ? "Xerces returned no schema model"
+                    : String.join(" | ", loadErrors.subList(0, Math.min(5, loadErrors.size())));
             throw new IllegalArgumentException(
-                    "Unable to load XSD schema. Ensure the file is a valid XML Schema "
-                            + "(for pacs.008, use the official single-file XSD or a ZIP of related schemas).");
+                    "Unable to load XSD '" + sanitizeFileName(fileName) + "'. "
+                            + "If this is pacs.008 with imports, upload a ZIP of all related .xsd files. "
+                            + "Detail: " + detail);
+        }
+        if (!loadErrors.isEmpty()) {
+            log.warn("XSD loaded with {} warning/error(s): {}", loadErrors.size(), loadErrors.get(0));
         }
         return model;
+    }
+
+    private XSModel loadFromTempDirectory(XMLSchemaLoader loader, Map<String, byte[]> all, String fileName) {
+        try {
+            java.nio.file.Path tempDir = java.nio.file.Files.createTempDirectory("xsd-upload-");
+            try {
+                for (Map.Entry<String, byte[]> e : all.entrySet()) {
+                    java.nio.file.Path out = tempDir.resolve(sanitizeFileName(e.getKey()));
+                    java.nio.file.Files.write(out, e.getValue());
+                }
+                java.nio.file.Path primary = tempDir.resolve(sanitizeFileName(fileName));
+                if (!java.nio.file.Files.exists(primary)) {
+                    primary = tempDir.resolve(sanitizeFileName(choosePrimarySchema(all)));
+                }
+                return loader.loadURI(primary.toUri().toString());
+            } finally {
+                try (var paths = java.nio.file.Files.walk(tempDir)) {
+                    paths.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                        try {
+                            java.nio.file.Files.deleteIfExists(p);
+                        } catch (Exception ignored) {
+                        }
+                    });
+                }
+            }
+        } catch (Exception ex) {
+            log.warn("Temp-directory XSD load failed: {}", ex.getMessage());
+            return null;
+        }
     }
 
     private boolean looksLikeZip(byte[] bytes) {
@@ -791,6 +830,11 @@ public class XsdParserService {
         } else if (term instanceof XSElementDeclaration childElement) {
             int min = particle.getMinOccurs();
             int max = particle.getMaxOccursUnbounded() ? -1 : particle.getMaxOccurs();
+            // pacs.008 / ISO trees explode if every optional branch is fully expanded.
+            // Keep required paths; skip deep optional complex expansion to keep the UI usable.
+            if (min == 0 && depth >= 7) {
+                return children;
+            }
             String childXpath = parentXpath + "/" + childElement.getName();
             SchemaField child = mapElement(
                     childElement, childXpath, min, max == Integer.MAX_VALUE ? -1 : max, depth, typeStack);
@@ -931,6 +975,37 @@ public class XsdParserService {
             Map<String, byte[]> files,
             List<SchemaField> roots
     ) {
+    }
+
+    private static final class CollectingXniErrorHandler implements org.apache.xerces.xni.parser.XMLErrorHandler {
+        private final List<String> errors;
+
+        CollectingXniErrorHandler(List<String> errors) {
+            this.errors = errors;
+        }
+
+        @Override
+        public void warning(String domain, String key, org.apache.xerces.xni.parser.XMLParseException exception) {
+            // ignore
+        }
+
+        @Override
+        public void error(String domain, String key, org.apache.xerces.xni.parser.XMLParseException exception) {
+            errors.add(format(exception));
+        }
+
+        @Override
+        public void fatalError(String domain, String key, org.apache.xerces.xni.parser.XMLParseException exception) {
+            errors.add(format(exception));
+        }
+
+        private String format(org.apache.xerces.xni.parser.XMLParseException ex) {
+            String msg = ex.getMessage() != null ? ex.getMessage() : "schema error";
+            if (ex.getLineNumber() > 0) {
+                return "line " + ex.getLineNumber() + " — " + msg;
+            }
+            return msg;
+        }
     }
 
     /**

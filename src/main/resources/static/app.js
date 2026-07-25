@@ -110,13 +110,27 @@
 
         try {
             const res = await fetch('/upload-xsd', { method: 'POST', body: formData });
-            const data = await res.json().catch(() => ({}));
+            const raw = await res.text();
+            let data = {};
+            try {
+                data = raw ? JSON.parse(raw) : {};
+            } catch (_) {
+                throw new Error(
+                    'Upload failed (HTTP ' + res.status + '). '
+                    + 'Server returned a non-JSON response — often caused by a too-large schema or a proxy timeout. '
+                    + 'Try the official single-file pacs.008 XSD or a ZIP of related schemas. '
+                    + 'Raw: ' + String(raw || '').slice(0, 180)
+                );
+            }
             if (!res.ok || !data.success) {
                 throw new Error(data.message || ('Upload failed (HTTP ' + res.status + ')'));
             }
 
             state.roots = data.roots || [];
             state.selectedRootIndex = 0;
+            // Prefer Document root for ISO 20022
+            const docIdx = state.roots.findIndex(r => r && r.name === 'Document');
+            if (docIdx >= 0) state.selectedRootIndex = docIdx;
             state.fileName = data.fileName || file.name;
             state.schemaId = data.schemaId || '';
             state.lastXml = '';
@@ -131,7 +145,7 @@
 
             els.fileBadge.textContent = state.fileName;
             els.fileBadge.classList.remove('hidden');
-            setStatus(els.uploadStatus, `Parsed ${state.roots.length} root element(s). Ready for validated generation.`, false);
+            setStatus(els.uploadStatus, `Parsed ${state.roots.length} root element(s) from ${state.fileName}. Ready for validated generation.`, false);
             renderRootSelector();
             renderForm();
             setMode('manual');

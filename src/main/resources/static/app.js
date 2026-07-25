@@ -802,7 +802,7 @@
             const d = randomDateNearToday(30);
             return `${formatDate(d)}T12:00`;
         }
-        if (type === 'time' || el.type === 'time') return '12:00';
+        if (type === 'time' || el.type === 'time') return '12:00:00';
         if (type === 'gyearmonth' || el.type === 'month') {
             return `${randInt(2020, 2030)}-${String(randInt(1, 12)).padStart(2, '0')}`;
         }
@@ -1006,7 +1006,10 @@
             return `${formatDate(d)}T${hh}:${mm}:${ss}`;
         }
         if (type === 'time') {
-            return `${String(randInt(0, 23)).padStart(2, '0')}:${String(randInt(0, 59)).padStart(2, '0')}`;
+            const hh = String(randInt(0, 23)).padStart(2, '0');
+            const mm = String(randInt(0, 59)).padStart(2, '0');
+            const ss = String(randInt(0, 59)).padStart(2, '0');
+            return `${hh}:${mm}:${ss}`;
         }
 
         // Patterns must win over generic integer/decimal/alpha fallbacks
@@ -1855,8 +1858,11 @@
         if (!el || el.disabled) return '';
         if (el.type === 'checkbox') return el.checked ? 'true' : 'false';
         let v = el.value;
-        // datetime-local omits seconds; xs:dateTime requires them
+        // datetime-local / time omit seconds; xs:dateTime / xs:time require them
         if (el.type === 'datetime-local' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(v)) {
+            v = v + ':00';
+        }
+        if (el.type === 'time' && /^\d{2}:\d{2}$/.test(v)) {
             v = v + ':00';
         }
         return v;

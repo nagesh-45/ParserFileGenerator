@@ -6,7 +6,7 @@ package com.xsdgenerator;
  */
 public final class AppBuild {
 
-    public static final String ID = "2026-07-25g";
+    public static final String ID = "2026-07-25h";
 
     private AppBuild() {
     }

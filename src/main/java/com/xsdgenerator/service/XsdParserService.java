@@ -1016,6 +1016,13 @@ public class XsdParserService {
         if ("dateTime".equals(type) && value.matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}")) {
             return value + ":00";
         }
+        // HTML <input type="time"> yields HH:mm; xs:time requires HH:mm:ss
+        if ("time".equals(type) && value.matches("\\d{2}:\\d{2}")) {
+            return value + ":00";
+        }
+        if ("time".equals(type) && value.matches("\\d{2}:\\d{2}:\\d{2}\\.\\d+")) {
+            return value.substring(0, 8);
+        }
         // Enforce fractionDigits=0 (or integer type) by dropping a fractional part
         if (("integer".equals(type) || (field.getFractionDigits() != null && field.getFractionDigits() == 0))
                 && value.matches("-?\\d+\\.\\d+")) {

@@ -4,6 +4,8 @@ target/
 *.jar.original
 *.war
 *.class
+# Keep the committed Maven Wrapper jar (needed to build without a local Maven install)
+!.mvn/wrapper/maven-wrapper.jar
 
 # Share / packaging artifacts
 dist/

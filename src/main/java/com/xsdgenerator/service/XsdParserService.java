@@ -465,15 +465,20 @@ public class XsdParserService {
         parent.appendChild(buildElement(document, child, childValue));
     }
 
+    private boolean isEffectivelyRequired(SchemaField field) {
+        // xs:choice alternatives are modeled with required=false; mandatory choices still must appear.
+        return field.isRequired() || field.isChoiceMandatory();
+    }
+
     private boolean shouldOmit(SchemaField field, Object value) {
         if (value == null) {
-            return !field.isRequired();
+            return !isEffectivelyRequired(field);
         }
         if (value instanceof String s) {
-            return s.trim().isEmpty() && !field.isRequired();
+            return s.trim().isEmpty() && !isEffectivelyRequired(field);
         }
         if (value instanceof Map<?, ?> map) {
-            return map.isEmpty() && !field.isRequired();
+            return map.isEmpty() && !isEffectivelyRequired(field);
         }
         return false;
     }
@@ -493,7 +498,7 @@ public class XsdParserService {
     private Object enrichNode(SchemaField field, Object value) {
         if (field.isAttribute()) {
             if (value == null || String.valueOf(value).isBlank()) {
-                return field.isRequired() ? defaultLexicalValue(field) : value;
+                return isEffectivelyRequired(field) ? defaultLexicalValue(field) : value;
             }
             return value;
         }
@@ -505,16 +510,20 @@ public class XsdParserService {
                 Map<String, Object> wrap = valueMap != null ? new LinkedHashMap<>(valueMap) : new LinkedHashMap<>();
                 Object text = wrap.containsKey("_text") ? wrap.get("_text") : (valueMap == null ? value : null);
                 if (text == null || String.valueOf(text).isBlank()) {
-                    text = defaultLexicalValue(field);
+                    if (isEffectivelyRequired(field) || hasAttrs) {
+                        text = defaultLexicalValue(field);
+                    }
                 }
-                wrap.put("_text", text);
+                if (text != null && !String.valueOf(text).isBlank()) {
+                    wrap.put("_text", text);
+                }
                 Map<String, Object> attrs = asMap(wrap.get("_attrs"));
                 attrs = attrs != null ? new LinkedHashMap<>(attrs) : new LinkedHashMap<>();
                 if (field.getAttributes() != null) {
                     for (SchemaField attr : field.getAttributes()) {
                         Object av = attrs.get(attr.getName());
                         if ((av == null || String.valueOf(av).isBlank())
-                                && (attr.isRequired() || "Ccy".equals(attr.getName()))) {
+                                && (isEffectivelyRequired(attr) || "Ccy".equals(attr.getName()))) {
                             attrs.put(attr.getName(), defaultLexicalValue(attr));
                         }
                     }
@@ -525,7 +534,7 @@ public class XsdParserService {
                 return wrap;
             }
             if (value == null || String.valueOf(value).isBlank()) {
-                return field.isRequired() ? defaultLexicalValue(field) : value;
+                return isEffectivelyRequired(field) ? defaultLexicalValue(field) : value;
             }
             return value;
         }
@@ -536,9 +545,7 @@ public class XsdParserService {
         List<SchemaField> selected = selectChildrenForEnrichment(field.getChildren(), map);
         for (SchemaField child : selected) {
             // xs:choice alternatives are marked required=false; only force-fill when the choice itself is mandatory
-            boolean must = child.isRequired()
-                    || map.containsKey(child.getName())
-                    || (child.getChoiceGroup() != null && child.isChoiceMandatory());
+            boolean must = isEffectivelyRequired(child) || map.containsKey(child.getName());
             if (!must) {
                 continue;
             }
@@ -550,13 +557,13 @@ public class XsdParserService {
                     for (Object item : list) {
                         enrichedList.add(enrichNode(child, item));
                     }
-                    if (enrichedList.isEmpty() && child.isRequired()) {
+                    if (enrichedList.isEmpty() && isEffectivelyRequired(child)) {
                         enrichedList.add(enrichNode(child, null));
                     }
                     map.put(child.getName(), enrichedList);
                 } else if (childVal != null) {
                     map.put(child.getName(), List.of(enrichNode(child, childVal)));
-                } else if (child.isRequired()) {
+                } else if (isEffectivelyRequired(child)) {
                     map.put(child.getName(), List.of(enrichNode(child, null)));
                 }
             } else {

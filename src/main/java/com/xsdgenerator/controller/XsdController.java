@@ -38,7 +38,7 @@ public class XsdController {
     @ResponseBody
     public ResponseEntity<Map<String, Object>> uploadXsd(@RequestParam("file") MultipartFile file) {
         if (file == null || file.isEmpty()) {
-            return ResponseEntity.badRequest().body(error("Please select a non-empty .xsd file"));
+            return ResponseEntity.badRequest().body(error("Please select a non-empty .xsd or .zip file"));
         }
 
         String originalName = file.getOriginalFilename() != null ? file.getOriginalFilename() : "schema.xsd";
@@ -50,25 +50,27 @@ public class XsdController {
         }
 
         String lower = originalName.toLowerCase();
-        boolean looksLikeSchema = lower.endsWith(".xsd") || lower.endsWith(".xml");
+        boolean looksLikeSchema = lower.endsWith(".xsd") || lower.endsWith(".xml") || lower.endsWith(".zip");
         // Some pickers strip extensions or report blank names — fall back to content sniff.
         if (!looksLikeSchema) {
             String contentType = file.getContentType() != null ? file.getContentType().toLowerCase() : "";
             boolean xmlMime = contentType.contains("xml") || contentType.contains("xsd")
+                    || contentType.contains("zip")
                     || contentType.equals("application/octet-stream") || contentType.isBlank();
             if (xmlMime) {
                 originalName = originalName.isBlank() || !originalName.contains(".")
                         ? "schema.xsd"
-                        : originalName + ".xsd";
+                        : originalName + (contentType.contains("zip") ? ".zip" : ".xsd");
                 looksLikeSchema = true;
             }
         }
         if (!looksLikeSchema) {
-            return ResponseEntity.badRequest().body(error("Only .xsd (or schema .xml) files are supported"));
+            return ResponseEntity.badRequest().body(error(
+                    "Only .xsd / schema .xml / .zip (multi-file pacs schemas) are supported"));
         }
 
         try {
-            ParsedSchema parsed = xsdParserService.parseAndStoreXsd(file.getBytes(), originalName);
+            ParsedSchema parsed = xsdParserService.parseAndStoreUpload(file.getBytes(), originalName);
             Map<String, Object> response = new HashMap<>();
             response.put("success", true);
             response.put("schemaId", parsed.schemaId());
@@ -91,7 +93,7 @@ public class XsdController {
         try {
             validateGenerateRequest(request);
             String xml = xsdParserService.generateAndValidateXml(
-                    request.getSchemaId(), request.getSchema(), request.getValues());
+                    request.getSchemaId(), resolveClientSchema(request), request.getValues());
             Map<String, Object> response = new HashMap<>();
             response.put("success", true);
             response.put("validated", true);
@@ -114,8 +116,8 @@ public class XsdController {
         try {
             validateGenerateRequest(request);
             String xml = xsdParserService.generateAndValidateXml(
-                    request.getSchemaId(), request.getSchema(), request.getValues());
-            String rootName = request.getSchema().getName() != null ? request.getSchema().getName() : "document";
+                    request.getSchemaId(), resolveClientSchema(request), request.getValues());
+            String rootName = resolveRootName(request);
             String fileName = rootName.replaceAll("[^a-zA-Z0-9._-]", "_") + ".xml";
 
             return ResponseEntity.ok()
@@ -134,15 +136,35 @@ public class XsdController {
     }
 
     private void validateGenerateRequest(GenerateXmlRequest request) {
-        if (request == null || request.getSchema() == null) {
-            throw new IllegalArgumentException("Schema metadata is required to generate XML");
+        if (request == null) {
+            throw new IllegalArgumentException("Request body is required");
         }
         if (request.getSchemaId() == null || request.getSchemaId().isBlank()) {
             throw new IllegalArgumentException("schemaId is required. Please upload the XSD again.");
         }
-        if (request.getSchema().getName() == null || request.getSchema().getName().isBlank()) {
+        if (resolveRootName(request).isBlank()) {
             throw new IllegalArgumentException("Root element name is missing from schema metadata");
         }
+    }
+
+    private com.xsdgenerator.dto.SchemaField resolveClientSchema(GenerateXmlRequest request) {
+        if (request.getSchema() != null && request.getSchema().getName() != null
+                && !request.getSchema().getName().isBlank()) {
+            return request.getSchema();
+        }
+        com.xsdgenerator.dto.SchemaField stub = new com.xsdgenerator.dto.SchemaField();
+        stub.setName(resolveRootName(request));
+        return stub;
+    }
+
+    private String resolveRootName(GenerateXmlRequest request) {
+        if (request.getRootName() != null && !request.getRootName().isBlank()) {
+            return request.getRootName();
+        }
+        if (request.getSchema() != null && request.getSchema().getName() != null) {
+            return request.getSchema().getName();
+        }
+        return "";
     }
 
     private Map<String, Object> error(String message) {

@@ -67,7 +67,8 @@ assets. Maven, Node.js, and an internet connection are not required at runtime.
 
 ## Workflow
 
-1. Upload an `.xsd` file (try `samples/payment.xsd`).
+1. Upload an `.xsd` file (try `samples/payment.xsd` or `samples/pacs.008.001.08-mini.xsd`).
+   For full ISO 20022 packages that use imports, upload a **`.zip`** containing the message XSD plus related schemas.
 2. Choose how to provide values:
    - **Enter values manually** — fill the form yourself
    - **Generate with random valid values** — auto-fill type-safe sample data (you can still edit)

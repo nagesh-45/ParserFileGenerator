@@ -8,6 +8,8 @@ import java.util.Map;
 public class GenerateXmlRequest {
 
     private String schemaId;
+    /** Optional; preferred over embedding the full schema tree for large XSDs like pacs.008. */
+    private String rootName;
     private SchemaField schema;
     private Map<String, Object> values;
 
@@ -17,6 +19,14 @@ public class GenerateXmlRequest {
 
     public void setSchemaId(String schemaId) {
         this.schemaId = schemaId;
+    }
+
+    public String getRootName() {
+        return rootName;
+    }
+
+    public void setRootName(String rootName) {
+        this.rootName = rootName;
     }
 
     public SchemaField getSchema() {

@@ -42,18 +42,28 @@ import javax.xml.validation.Schema;
 import javax.xml.validation.SchemaFactory;
 import javax.xml.validation.Validator;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.Reader;
 import java.io.StringReader;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+
+import org.w3c.dom.ls.LSResourceResolver;
 
 /**
  * Parses XSD schemas via Apache Xerces {@link XSModel}, builds formatted XML from form values,
@@ -64,28 +74,76 @@ public class XsdParserService {
 
     private static final Logger log = LoggerFactory.getLogger(XsdParserService.class);
     private static final String XSD_NS = XMLConstants.W3C_XML_SCHEMA_NS_URI;
+    /** Prevents StackOverflow on recursive ISO 20022 types (common in pacs/pain/camt). */
+    private static final int MAX_MAPPING_DEPTH = 18;
 
     private final ConcurrentHashMap<String, StoredSchema> schemaStore = new ConcurrentHashMap<>();
     private final AtomicInteger choiceCounter = new AtomicInteger();
 
     public ParsedSchema parseAndStoreXsd(byte[] xsdBytes, String fileName) {
-        if (xsdBytes == null || xsdBytes.length == 0) {
+        return parseAndStoreUpload(xsdBytes, fileName);
+    }
+
+    /**
+     * Accepts a single .xsd or a .zip of related XSDs (pacs.008 + imports).
+     */
+    public ParsedSchema parseAndStoreUpload(byte[] uploadBytes, String fileName) {
+        if (uploadBytes == null || uploadBytes.length == 0) {
             throw new IllegalArgumentException("XSD file is empty");
         }
+        String safeName = sanitizeFileName(fileName);
+        Map<String, byte[]> files = new LinkedHashMap<>();
+        String primaryName;
+        try {
+            if (safeName.toLowerCase(Locale.ROOT).endsWith(".zip") || looksLikeZip(uploadBytes)) {
+                files.putAll(extractXsdFilesFromZip(uploadBytes));
+                if (files.isEmpty()) {
+                    throw new IllegalArgumentException("ZIP did not contain any .xsd files");
+                }
+                primaryName = choosePrimarySchema(files);
+            } else {
+                primaryName = safeName.toLowerCase(Locale.ROOT).endsWith(".xsd")
+                        || safeName.toLowerCase(Locale.ROOT).endsWith(".xml")
+                        ? safeName
+                        : safeName + ".xsd";
+                files.put(primaryName, uploadBytes.clone());
+            }
+        } catch (IllegalArgumentException ex) {
+            throw ex;
+        } catch (Exception ex) {
+            throw new IllegalArgumentException("Unable to read uploaded schema: " + ex.getMessage(), ex);
+        }
 
-        List<SchemaField> roots = parseXsd(xsdBytes, fileName);
+        byte[] primaryBytes = files.get(primaryName);
+        List<SchemaField> roots;
+        try {
+            roots = parseXsd(primaryBytes, primaryName, files);
+        } catch (StackOverflowError err) {
+            throw new IllegalArgumentException(
+                    "Schema is too deeply recursive to expand. Upload a single message XSD "
+                            + "(e.g. pacs.008.001.08.xsd) or a ZIP of its related XSDs.");
+        } catch (OutOfMemoryError err) {
+            throw new IllegalArgumentException(
+                    "Schema is too large to expand in memory. Prefer the official single-file pacs.008 XSD.");
+        }
+
         String schemaId = UUID.randomUUID().toString();
-        schemaStore.put(schemaId, new StoredSchema(fileName, xsdBytes.clone()));
-        log.info("Stored XSD '{}' under schemaId={}", fileName, schemaId);
-        return new ParsedSchema(schemaId, fileName, roots);
+        schemaStore.put(schemaId, new StoredSchema(primaryName, primaryBytes.clone(), files, roots));
+        log.info("Stored XSD '{}' ({} companion file(s)) under schemaId={}, roots={}",
+                primaryName, files.size(), schemaId, roots.size());
+        return new ParsedSchema(schemaId, primaryName, roots);
     }
 
     public List<SchemaField> parseXsd(byte[] xsdBytes, String fileName) {
+        return parseXsd(xsdBytes, fileName, Map.of(sanitizeFileName(fileName), xsdBytes));
+    }
+
+    public List<SchemaField> parseXsd(byte[] xsdBytes, String fileName, Map<String, byte[]> companions) {
         if (xsdBytes == null || xsdBytes.length == 0) {
             throw new IllegalArgumentException("XSD file is empty");
         }
 
-        XSModel model = loadSchemaModel(xsdBytes, fileName);
+        XSModel model = loadSchemaModel(xsdBytes, fileName, companions);
         XSNamedMap elements = model.getComponents(XSConstants.ELEMENT_DECLARATION);
         if (elements == null || elements.getLength() == 0) {
             throw new IllegalArgumentException("No global element declarations found in the XSD");
@@ -94,9 +152,25 @@ public class XsdParserService {
         List<SchemaField> roots = new ArrayList<>();
         for (int i = 0; i < elements.getLength(); i++) {
             XSElementDeclaration element = (XSElementDeclaration) elements.item(i);
-            SchemaField field = mapElement(element, "/" + element.getName(), 1, 1);
+            SchemaField field = mapElement(
+                    element,
+                    "/" + element.getName(),
+                    1,
+                    1,
+                    0,
+                    Collections.newSetFromMap(new IdentityHashMap<>()));
             roots.add(field);
         }
+
+        // Prefer ISO 20022 Document root first for pacs/pain/camt schemas
+        roots.sort((a, b) -> {
+            boolean aDoc = "Document".equals(a.getName());
+            boolean bDoc = "Document".equals(b.getName());
+            if (aDoc == bDoc) {
+                return String.valueOf(a.getName()).compareToIgnoreCase(String.valueOf(b.getName()));
+            }
+            return aDoc ? -1 : 1;
+        });
 
         log.info("Parsed XSD '{}': {} root element(s)", fileName, roots.size());
         return roots;
@@ -104,12 +178,44 @@ public class XsdParserService {
 
     /**
      * Generates XML from form values and validates it against the previously uploaded XSD.
+     * Uses the server-stored schema tree (needed for large pacs.008 payloads).
      */
-    public String generateAndValidateXml(String schemaId, SchemaField rootSchema, Map<String, Object> values) {
+    public String generateAndValidateXml(String schemaId, SchemaField clientSchema, Map<String, Object> values) {
         StoredSchema stored = requireStoredSchema(schemaId);
+        SchemaField rootSchema = resolveRootSchema(stored, clientSchema);
         String xml = generateXml(rootSchema, values);
-        validateXmlAgainstXsd(xml, stored.bytes(), stored.fileName());
+        validateXmlAgainstXsd(xml, stored);
         return xml;
+    }
+
+    public String generateAndValidateXml(String schemaId, String rootName, Map<String, Object> values) {
+        StoredSchema stored = requireStoredSchema(schemaId);
+        SchemaField stub = new SchemaField();
+        stub.setName(rootName);
+        return generateAndValidateXml(schemaId, stub, values);
+    }
+
+    private SchemaField resolveRootSchema(StoredSchema stored, SchemaField clientSchema) {
+        String wanted = clientSchema != null ? clientSchema.getName() : null;
+        if (wanted == null || wanted.isBlank()) {
+            if (stored.roots() != null && !stored.roots().isEmpty()) {
+                return stored.roots().get(0);
+            }
+            throw new IllegalArgumentException("Root element name is missing");
+        }
+        if (stored.roots() != null) {
+            for (SchemaField root : stored.roots()) {
+                if (wanted.equals(root.getName())) {
+                    return root;
+                }
+            }
+        }
+        // Fall back to client schema only if server tree is missing (should not happen)
+        if (clientSchema != null && clientSchema.getChildren() != null && !clientSchema.getChildren().isEmpty()) {
+            return clientSchema;
+        }
+        throw new IllegalArgumentException(
+                "Root element '" + wanted + "' was not found in the uploaded schema. Please re-upload the XSD.");
     }
 
     public String generateXml(SchemaField rootSchema, Map<String, Object> values) {
@@ -128,6 +234,10 @@ public class XsdParserService {
             }
 
             Element rootElement = buildElement(document, rootSchema, rootValue);
+            // Ensure default xmlns is present for ISO 20022 Document roots
+            if (rootSchema.getNamespace() != null && !rootSchema.getNamespace().isBlank()) {
+                rootElement.setAttributeNS(XMLConstants.XMLNS_ATTRIBUTE_NS_URI, "xmlns", rootSchema.getNamespace());
+            }
             document.appendChild(rootElement);
             return formatXml(document);
         } catch (Exception e) {
@@ -136,25 +246,27 @@ public class XsdParserService {
     }
 
     public void validateXmlAgainstXsd(String xml, byte[] xsdBytes, String xsdFileName) {
+        Map<String, byte[]> files = new LinkedHashMap<>();
+        files.put(sanitizeFileName(xsdFileName), xsdBytes);
+        validateXmlAgainstXsd(xml, new StoredSchema(xsdFileName, xsdBytes, files, List.of()));
+    }
+
+    private void validateXmlAgainstXsd(String xml, StoredSchema stored) {
         if (xml == null || xml.isBlank()) {
             throw new IllegalArgumentException("Generated XML is empty");
         }
-        if (xsdBytes == null || xsdBytes.length == 0) {
+        if (stored == null || stored.bytes() == null || stored.bytes().length == 0) {
             throw new IllegalArgumentException("Uploaded XSD is missing; please re-upload the schema");
         }
 
         List<String> errors = new ArrayList<>();
         try {
             SchemaFactory schemaFactory = SchemaFactory.newInstance(XMLConstants.W3C_XML_SCHEMA_NS_URI);
-            // Harden against XXE while validating untrusted uploads
-            try {
-                schemaFactory.setProperty(XMLConstants.ACCESS_EXTERNAL_DTD, "");
-                schemaFactory.setProperty(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
-            } catch (Exception ignored) {
-                // Some JAXP implementations may not support these properties
-            }
+            // Allow resolving companion schemas from the uploaded ZIP / same package only
+            schemaFactory.setResourceResolver(new MapLsResourceResolver(stored.files(), stored.fileName()));
 
-            Source schemaSource = new StreamSource(new ByteArrayInputStream(xsdBytes), sanitizeFileName(xsdFileName));
+            Source schemaSource = new StreamSource(
+                    new ByteArrayInputStream(stored.bytes()), sanitizeFileName(stored.fileName()));
             Schema schema = schemaFactory.newSchema(schemaSource);
             Validator validator = schema.newValidator();
             validator.setErrorHandler(new CollectingErrorHandler(errors));
@@ -371,27 +483,99 @@ public class XsdParserService {
         return writer.toString();
     }
 
-    private XSModel loadSchemaModel(byte[] xsdBytes, String fileName) {
+    private XSModel loadSchemaModel(byte[] xsdBytes, String fileName, Map<String, byte[]> companions) {
         XMLSchemaLoader loader = new XMLSchemaLoader();
-        LSInput input = new ByteArrayLSInput(xsdBytes, fileName);
+        loader.setEntityResolver(new MapXmlEntityResolver(companions != null ? companions : Map.of(), fileName));
+        LSInput input = new ByteArrayLSInput(xsdBytes, sanitizeFileName(fileName));
         XSModel model = loader.load(input);
         if (model == null) {
             try {
-                java.nio.file.Path temp = java.nio.file.Files.createTempFile("upload-", "-" + sanitizeFileName(fileName));
-                java.nio.file.Files.write(temp, xsdBytes);
+                java.nio.file.Path tempDir = java.nio.file.Files.createTempDirectory("xsd-upload-");
                 try {
-                    model = loader.loadURI(temp.toUri().toString());
+                    Map<String, byte[]> all = companions != null ? companions : Map.of(sanitizeFileName(fileName), xsdBytes);
+                    for (Map.Entry<String, byte[]> e : all.entrySet()) {
+                        java.nio.file.Path out = tempDir.resolve(sanitizeFileName(e.getKey()));
+                        java.nio.file.Files.write(out, e.getValue());
+                    }
+                    java.nio.file.Path primary = tempDir.resolve(sanitizeFileName(fileName));
+                    if (!java.nio.file.Files.exists(primary)) {
+                        primary = tempDir.resolve(sanitizeFileName(choosePrimarySchema(all)));
+                    }
+                    model = loader.loadURI(primary.toUri().toString());
                 } finally {
-                    java.nio.file.Files.deleteIfExists(temp);
+                    try (var paths = java.nio.file.Files.walk(tempDir)) {
+                        paths.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                            try {
+                                java.nio.file.Files.deleteIfExists(p);
+                            } catch (Exception ignored) {
+                            }
+                        });
+                    }
                 }
             } catch (Exception ex) {
-                throw new IllegalArgumentException("Unable to load XSD schema. Ensure the file is a valid XML Schema.", ex);
+                throw new IllegalArgumentException(
+                        "Unable to load XSD schema. For pacs.008 upload the message XSD, "
+                                + "or a ZIP containing it plus any imported XSDs. Detail: " + ex.getMessage(),
+                        ex);
             }
         }
         if (model == null) {
-            throw new IllegalArgumentException("Unable to load XSD schema. Ensure the file is a valid XML Schema.");
+            throw new IllegalArgumentException(
+                    "Unable to load XSD schema. Ensure the file is a valid XML Schema "
+                            + "(for pacs.008, use the official single-file XSD or a ZIP of related schemas).");
         }
         return model;
+    }
+
+    private boolean looksLikeZip(byte[] bytes) {
+        return bytes != null && bytes.length >= 4
+                && bytes[0] == 'P' && bytes[1] == 'K';
+    }
+
+    private Map<String, byte[]> extractXsdFilesFromZip(byte[] zipBytes) throws Exception {
+        Map<String, byte[]> files = new LinkedHashMap<>();
+        try (ZipInputStream zis = new ZipInputStream(new ByteArrayInputStream(zipBytes))) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (entry.isDirectory()) {
+                    continue;
+                }
+                String name = entry.getName().replace('\\', '/');
+                int slash = name.lastIndexOf('/');
+                String base = slash >= 0 ? name.substring(slash + 1) : name;
+                if (!base.toLowerCase(Locale.ROOT).endsWith(".xsd")) {
+                    continue;
+                }
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                zis.transferTo(bos);
+                files.put(sanitizeFileName(base), bos.toByteArray());
+            }
+        }
+        return files;
+    }
+
+    private String choosePrimarySchema(Map<String, byte[]> files) {
+        List<String> names = new ArrayList<>(files.keySet());
+        names.sort((a, b) -> {
+            int sa = primaryScore(a);
+            int sb = primaryScore(b);
+            if (sa != sb) {
+                return Integer.compare(sb, sa);
+            }
+            return Integer.compare(files.get(b).length, files.get(a).length);
+        });
+        return names.get(0);
+    }
+
+    private int primaryScore(String name) {
+        String n = name.toLowerCase(Locale.ROOT);
+        int score = 0;
+        if (n.contains("pacs.008")) score += 100;
+        if (n.contains("pacs.")) score += 40;
+        if (n.contains("pain.")) score += 30;
+        if (n.contains("camt.")) score += 20;
+        if (n.startsWith("head.")) score -= 50;
+        return score;
     }
 
     private String sanitizeFileName(String fileName) {
@@ -401,7 +585,8 @@ public class XsdParserService {
         return fileName.replaceAll("[^a-zA-Z0-9._-]", "_");
     }
 
-    private SchemaField mapElement(XSElementDeclaration element, String xpath, int minOccurs, int maxOccurs) {
+    private SchemaField mapElement(XSElementDeclaration element, String xpath, int minOccurs, int maxOccurs,
+                                    int depth, Set<XSTypeDefinition> typeStack) {
         SchemaField field = new SchemaField();
         field.setName(element.getName());
         field.setNamespace(element.getNamespace());
@@ -434,9 +619,24 @@ public class XsdParserService {
             } else {
                 field.setComplex(true);
                 field.setType(resolveTypeName(typeDef));
+
+                // Truncate recursive / extremely deep ISO types (pacs.008 has several)
+                if (typeStack.contains(typeDef) || depth >= MAX_MAPPING_DEPTH) {
+                    String note = typeStack.contains(typeDef)
+                            ? "Recursive type truncated"
+                            : "Deep nesting truncated at depth " + depth;
+                    field.setDocumentation(field.getDocumentation() == null ? note : field.getDocumentation() + " · " + note);
+                    return field;
+                }
+
                 XSParticle particle = complex.getParticle();
                 if (particle != null) {
-                    field.getChildren().addAll(mapParticleChildren(particle, xpath, null));
+                    typeStack.add(typeDef);
+                    try {
+                        field.getChildren().addAll(mapParticleChildren(particle, xpath, null, depth + 1, typeStack));
+                    } finally {
+                        typeStack.remove(typeDef);
+                    }
                 }
             }
         } else {
@@ -558,7 +758,8 @@ public class XsdParserService {
         }
     }
 
-    private List<SchemaField> mapParticleChildren(XSParticle particle, String parentXpath, String choiceGroup) {
+    private List<SchemaField> mapParticleChildren(XSParticle particle, String parentXpath, String choiceGroup,
+                                                   int depth, Set<XSTypeDefinition> typeStack) {
         List<SchemaField> children = new ArrayList<>();
         XSTerm term = particle.getTerm();
         if (term == null) {
@@ -575,7 +776,7 @@ public class XsdParserService {
             for (int i = 0; i < particles.getLength(); i++) {
                 XSParticle childParticle = (XSParticle) particles.item(i);
                 if (isChoice) {
-                    List<SchemaField> mapped = mapParticleChildren(childParticle, parentXpath, null);
+                    List<SchemaField> mapped = mapParticleChildren(childParticle, parentXpath, null, depth, typeStack);
                     for (SchemaField bf : mapped) {
                         bf.setChoiceGroup(groupId);
                         bf.setChoiceBranch(i);
@@ -584,14 +785,15 @@ public class XsdParserService {
                     }
                     children.addAll(mapped);
                 } else {
-                    children.addAll(mapParticleChildren(childParticle, parentXpath, groupId));
+                    children.addAll(mapParticleChildren(childParticle, parentXpath, groupId, depth, typeStack));
                 }
             }
         } else if (term instanceof XSElementDeclaration childElement) {
             int min = particle.getMinOccurs();
             int max = particle.getMaxOccursUnbounded() ? -1 : particle.getMaxOccurs();
             String childXpath = parentXpath + "/" + childElement.getName();
-            SchemaField child = mapElement(childElement, childXpath, min, max == Integer.MAX_VALUE ? -1 : max);
+            SchemaField child = mapElement(
+                    childElement, childXpath, min, max == Integer.MAX_VALUE ? -1 : max, depth, typeStack);
             if (choiceGroup != null) {
                 child.setChoiceGroup(choiceGroup);
                 child.setRequired(false);
@@ -723,7 +925,106 @@ public class XsdParserService {
     public record ParsedSchema(String schemaId, String fileName, List<SchemaField> roots) {
     }
 
-    private record StoredSchema(String fileName, byte[] bytes) {
+    private record StoredSchema(
+            String fileName,
+            byte[] bytes,
+            Map<String, byte[]> files,
+            List<SchemaField> roots
+    ) {
+    }
+
+    /**
+     * Resolves xs:import / xs:include against files uploaded in the same ZIP (or the primary XSD).
+     */
+    private static final class MapLsResourceResolver implements LSResourceResolver {
+        private final Map<String, byte[]> filesByName;
+        private final String primaryName;
+
+        MapLsResourceResolver(Map<String, byte[]> files, String primaryName) {
+            this.filesByName = new HashMap<>();
+            if (files != null) {
+                for (Map.Entry<String, byte[]> e : files.entrySet()) {
+                    this.filesByName.put(basename(e.getKey()).toLowerCase(Locale.ROOT), e.getValue());
+                    this.filesByName.put(e.getKey().toLowerCase(Locale.ROOT), e.getValue());
+                }
+            }
+            this.primaryName = primaryName;
+        }
+
+        @Override
+        public LSInput resolveResource(String type, String namespaceURI, String publicId,
+                                       String systemId, String baseURI) {
+            byte[] data = find(systemId);
+            if (data == null && primaryName != null) {
+                data = find(primaryName);
+            }
+            if (data == null) {
+                return null;
+            }
+            return new ByteArrayLSInput(data, systemId != null ? basename(systemId) : primaryName);
+        }
+
+        private byte[] find(String systemId) {
+            if (systemId == null || systemId.isBlank()) {
+                return null;
+            }
+            String base = basename(systemId).toLowerCase(Locale.ROOT);
+            byte[] data = filesByName.get(base);
+            if (data != null) {
+                return data;
+            }
+            return filesByName.get(systemId.toLowerCase(Locale.ROOT));
+        }
+
+        private static String basename(String path) {
+            String p = path.replace('\\', '/');
+            int slash = p.lastIndexOf('/');
+            return slash >= 0 ? p.substring(slash + 1) : p;
+        }
+    }
+
+    private static final class MapXmlEntityResolver implements org.apache.xerces.xni.parser.XMLEntityResolver {
+        private final Map<String, byte[]> filesByName;
+
+        MapXmlEntityResolver(Map<String, byte[]> files, String primaryName) {
+            this.filesByName = new HashMap<>();
+            if (files != null) {
+                for (Map.Entry<String, byte[]> e : files.entrySet()) {
+                    this.filesByName.put(basename(e.getKey()).toLowerCase(Locale.ROOT), e.getValue());
+                }
+            }
+            if (primaryName != null && files != null && files.containsKey(primaryName)) {
+                this.filesByName.put(basename(primaryName).toLowerCase(Locale.ROOT), files.get(primaryName));
+            }
+        }
+
+        @Override
+        public org.apache.xerces.xni.parser.XMLInputSource resolveEntity(
+                org.apache.xerces.xni.XMLResourceIdentifier resourceIdentifier) {
+            String systemId = resourceIdentifier != null ? resourceIdentifier.getLiteralSystemId() : null;
+            if (systemId == null && resourceIdentifier != null) {
+                systemId = resourceIdentifier.getExpandedSystemId();
+            }
+            if (systemId == null) {
+                return null;
+            }
+            byte[] data = filesByName.get(basename(systemId).toLowerCase(Locale.ROOT));
+            if (data == null) {
+                return null;
+            }
+            org.apache.xerces.xni.parser.XMLInputSource src = new org.apache.xerces.xni.parser.XMLInputSource(
+                    resourceIdentifier != null ? resourceIdentifier.getPublicId() : null,
+                    basename(systemId),
+                    resourceIdentifier != null ? resourceIdentifier.getBaseSystemId() : null);
+            src.setByteStream(new ByteArrayInputStream(data));
+            return src;
+        }
+
+        private static String basename(String path) {
+            String p = path.replace('\\', '/');
+            int slash = p.lastIndexOf('/');
+            return slash >= 0 ? p.substring(slash + 1) : p;
+        }
     }
 
     private static final class CollectingErrorHandler implements ErrorHandler {

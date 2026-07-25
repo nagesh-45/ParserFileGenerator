@@ -57,7 +57,7 @@
         if (!isAllowedSchemaFile(file)) {
             els.xsdFile.value = '';
             els.selectedFileName.textContent = 'No file selected';
-            setStatus(els.uploadStatus, 'Please choose a .xsd (or schema .xml) file.', true);
+            setStatus(els.uploadStatus, 'Please choose a .xsd / .xml / .zip file.', true);
             return;
         }
         els.selectedFileName.textContent = file.name;
@@ -79,7 +79,7 @@
         const file = e.dataTransfer.files[0];
         if (!file) return;
         if (!isAllowedSchemaFile(file)) {
-            setStatus(els.uploadStatus, 'Please drop a .xsd (or schema .xml) file.', true);
+            setStatus(els.uploadStatus, 'Please drop a .xsd / .xml / .zip file.', true);
             return;
         }
         const dt = new DataTransfer();
@@ -97,7 +97,7 @@
             return;
         }
         if (!isAllowedSchemaFile(file)) {
-            setStatus(els.uploadStatus, 'Only .xsd (or schema .xml) files are supported.', true);
+            setStatus(els.uploadStatus, 'Only .xsd / .xml / .zip files are supported.', true);
             return;
         }
 
@@ -1121,6 +1121,11 @@
         // Country / currency / BIC / IBAN shortcuts
         if (/^\[A-Z\]\{2(?:,2)?\}$/.test(p)) return pick(['US', 'GB', 'DE', 'FR', 'IN', 'NL', 'IE', 'CH']);
         if (/^\[A-Z\]\{3(?:,3)?\}$/.test(p)) return pick(['USD', 'EUR', 'GBP', 'INR', 'CHF', 'JPY']);
+        // UETR / UUID v4 used by pacs.008
+        if (/\[a-f0-9\]\{8\}-\[a-f0-9\]\{4\}-4\[a-f0-9\]/.test(p) || /uuid|uetr/i.test(field.typeName || '') || /^uetr$/i.test(field.name || '')) {
+            const h = () => 'xxxxxxxx'.replace(/x/g, () => pick('abcdef0123456789'.split('')));
+            return `${h().slice(0,8)}-${h().slice(0,4)}-4${h().slice(0,3)}-${pick(['8','9','a','b'])}${h().slice(0,3)}-${h()}${h().slice(0,4)}`;
+        }
         if (/\[A-Z\]\{6,6\}\[A-Z2-9\]/.test(p)) {
             return pick(['CHASUS33', 'DEUTDEFF', 'BNPAFRPP', 'BARCGB22', 'HDFCINBB']);
         }
@@ -1597,12 +1602,12 @@
     function isAllowedSchemaFile(file) {
         if (!file || !file.name) return false;
         const name = file.name.toLowerCase();
-        return name.endsWith('.xsd') || name.endsWith('.xml');
+        return name.endsWith('.xsd') || name.endsWith('.xml') || name.endsWith('.zip');
     }
 
     function normalizeSchemaFileName(name) {
         const base = String(name || 'schema.xsd').split(/[/\\]/).pop();
-        if (/\.xsd$/i.test(base) || /\.xml$/i.test(base)) return base;
+        if (/\.xsd$/i.test(base) || /\.xml$/i.test(base) || /\.zip$/i.test(base)) return base;
         return base + '.xsd';
     }
 
@@ -1628,7 +1633,9 @@
 
         return {
             schemaId: state.schemaId,
-            schema: root,
+            rootName: root.name,
+            // Thin stub only — full tree is kept server-side (critical for pacs.008 size)
+            schema: { name: root.name, namespace: root.namespace || null },
             values: values
         };
     }

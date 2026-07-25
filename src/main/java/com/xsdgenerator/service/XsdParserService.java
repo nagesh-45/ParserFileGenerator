@@ -221,38 +221,61 @@ public class XsdParserService {
         StoredSchema stored = requireStoredSchema(schemaId);
         SchemaField rootSchema = ensureMaterializedRoot(schemaId, stored, resolveRootSchema(stored, clientSchema));
         rootSchema = ensureIsoMessageChild(schemaId, stored, rootSchema);
-        Map<String, Object> enriched = enrichValuesForGeneration(rootSchema, values);
+
+        // Never start from a blank Document for pacs.008 — always seed the message element
+        Map<String, Object> seedValues = values != null ? new LinkedHashMap<>(values) : new LinkedHashMap<>();
+        seedValues = ensureDocumentMessageSeeded(rootSchema, seedValues);
+
+        Map<String, Object> enriched = enrichValuesForGeneration(rootSchema, seedValues);
         String xml = generateXml(rootSchema, enriched);
+        xml = rescueEmptyDocumentXml(schemaId, stored, rootSchema, xml);
 
         List<String> errors = collectValidationErrors(xml, stored);
         stored = requireStoredSchema(schemaId);
+        rootSchema = resolveRootSchema(stored, clientSchema);
 
         // Empty <Document/> against pacs.008 — rebuild the tree and fill from scratch once
-        if (!errors.isEmpty() && isMissingDocumentMessage(errors)) {
+        if (!errors.isEmpty() && (isMissingDocumentMessage(errors) || isEmptyDocumentXml(xml))) {
             log.warn("Document missing FIToFICstmrCdtTrf — forcing schema rematerialize and refill. xmlHead={}",
                     xml.length() > 200 ? xml.substring(0, 200).replace('\n', ' ') : xml.replace('\n', ' '));
             rootSchema = forceRematerializeRoot(schemaId, stored, rootSchema);
             rootSchema = ensureIsoMessageChild(schemaId, stored, rootSchema);
             Map<String, Object> fresh = new LinkedHashMap<>();
             fresh.put(rootSchema.getName(), new LinkedHashMap<>());
+            fresh = ensureDocumentMessageSeeded(rootSchema, fresh);
             enriched = enrichValuesForGeneration(rootSchema, fresh);
             xml = generateXml(rootSchema, enriched);
+            xml = rescueEmptyDocumentXml(schemaId, stored, rootSchema, xml);
             errors = collectValidationErrors(xml, stored);
             stored = requireStoredSchema(schemaId);
+            rootSchema = resolveRootSchema(stored, clientSchema);
         }
 
         for (int attempt = 0; !errors.isEmpty() && attempt < MAX_REPAIR_ATTEMPTS; attempt++) {
             Object repaired = repairOnce(stored, rootSchema, enriched.get(rootSchema.getName()), errors);
             if (repaired == null) {
+                // Last ditch: if Document is still empty, seed + regenerate once more
+                if (isMissingDocumentMessage(errors) || isEmptyDocumentXml(xml)) {
+                    Map<String, Object> forced = new LinkedHashMap<>();
+                    forced.put(rootSchema.getName(), new LinkedHashMap<>());
+                    forced = ensureDocumentMessageSeeded(rootSchema, forced);
+                    enriched = enrichValuesForGeneration(rootSchema, forced);
+                    xml = generateXml(rootSchema, enriched);
+                    xml = rescueEmptyDocumentXml(schemaId, stored, rootSchema, xml);
+                    errors = collectValidationErrors(xml, stored);
+                    if (!isEmptyDocumentXml(xml) && !isMissingDocumentMessage(errors)) {
+                        continue;
+                    }
+                }
                 break;
             }
             enriched.put(rootSchema.getName(), repaired);
             xml = generateXml(rootSchema, enriched);
+            xml = rescueEmptyDocumentXml(schemaId, stored, rootSchema, xml);
             errors = collectValidationErrors(xml, stored);
         }
 
         if (!errors.isEmpty()) {
-            // Include a short XML preview so UI/logs show what failed validation
             List<String> withPreview = new ArrayList<>(errors);
             String preview = xml == null ? "" : xml.replace('\n', ' ').trim();
             if (preview.length() > 280) {
@@ -268,6 +291,73 @@ public class XsdParserService {
                     withPreview);
         }
         return xml;
+    }
+
+    /**
+     * Puts FIToFICstmrCdtTrf (or the first Document child) into values so generation cannot emit
+     * an empty {@code <Document/>}.
+     */
+    private Map<String, Object> ensureDocumentMessageSeeded(SchemaField root, Map<String, Object> values) {
+        if (root == null || !"Document".equals(root.getName()) || root.getChildren() == null
+                || root.getChildren().isEmpty()) {
+            return values;
+        }
+        SchemaField message = root.getChildren().stream()
+                .filter(c -> c.getName() != null && c.getName().contains("CstmrCdtTrf"))
+                .findFirst()
+                .orElse(root.getChildren().get(0));
+
+        Map<String, Object> out = values != null ? new LinkedHashMap<>(values) : new LinkedHashMap<>();
+        Object docVal = out.containsKey(root.getName()) ? out.get(root.getName()) : out;
+        Map<String, Object> docMap = asMap(docVal);
+        if (docMap == null) {
+            docMap = new LinkedHashMap<>();
+        } else {
+            docMap = new LinkedHashMap<>(docMap);
+        }
+        if (!docMap.containsKey(message.getName()) || shouldOmit(message, docMap.get(message.getName()))) {
+            docMap.put(message.getName(), new LinkedHashMap<>());
+        }
+        out.put(root.getName(), docMap);
+        return out;
+    }
+
+    private boolean isEmptyDocumentXml(String xml) {
+        if (xml == null || xml.isBlank()) {
+            return true;
+        }
+        String compact = xml.replaceAll("\\s+", " ");
+        if (compact.matches("(?i).*?<Document\\b[^>]*/>.*")) {
+            return true;
+        }
+        return compact.contains("<Document") && !compact.contains("FIToFICstmrCdtTrf")
+                && !compact.matches("(?i).*?<Document\\b[^>]*>\\s*<[^/!?][^>]*>.*");
+    }
+
+    /**
+     * If generation somehow still produced an empty Document, rebuild once from a seeded message child.
+     */
+    private String rescueEmptyDocumentXml(String schemaId, StoredSchema stored, SchemaField root, String xml) {
+        if (!isEmptyDocumentXml(xml)) {
+            return xml;
+        }
+        log.warn("Rescuing empty Document XML (build {})", AppBuild.ID);
+        SchemaField fixed = ensureIsoMessageChild(schemaId, stored, root);
+        Map<String, Object> fresh = new LinkedHashMap<>();
+        fresh.put(fixed.getName(), new LinkedHashMap<>());
+        fresh = ensureDocumentMessageSeeded(fixed, fresh);
+        Map<String, Object> enriched = enrichValuesForGeneration(fixed, fresh);
+        String rescued = generateXml(fixed, enriched);
+        if (isEmptyDocumentXml(rescued) && fixed.getChildren() != null && !fixed.getChildren().isEmpty()) {
+            // Absolute last resort: DOM-append the first child element shell, then re-enrich
+            SchemaField msg = fixed.getChildren().get(0);
+            Map<String, Object> doc = new LinkedHashMap<>();
+            doc.put(msg.getName(), enrichNode(msg, null, true));
+            Map<String, Object> wrap = new LinkedHashMap<>();
+            wrap.put(fixed.getName(), doc);
+            rescued = generateXml(fixed, wrap);
+        }
+        return rescued;
     }
 
     private boolean isMissingDocumentMessage(List<String> errors) {
@@ -993,6 +1083,10 @@ public class XsdParserService {
     }
 
     private boolean shouldOmit(SchemaField field, Object value) {
+        // Never drop the pacs.008 message element under Document — empty Document always fails XSD
+        if (field != null && field.getName() != null && field.getName().contains("CstmrCdtTrf")) {
+            return false;
+        }
         if (value == null) {
             return !isEffectivelyRequired(field);
         }

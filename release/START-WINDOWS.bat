@@ -45,7 +45,7 @@ if errorlevel 1 (
 echo.
 echo Starting the application...
 echo Your browser will open at http://localhost:8080
-echo After it opens, confirm the page shows: build 2026-07-25d
+echo After it opens, confirm the page shows: build 2026-07-25g
 echo If upload succeeds you should also see Document children: 1 (FIToFICstmrCdtTrf).
 echo.
 echo Keep this window OPEN while using the app.

@@ -535,7 +535,10 @@ public class XsdParserService {
 
         List<SchemaField> selected = selectChildrenForEnrichment(field.getChildren(), map);
         for (SchemaField child : selected) {
-            boolean must = child.isRequired() || map.containsKey(child.getName());
+            // xs:choice alternatives are marked required=false, but the chosen branch must still be emitted
+            boolean must = child.isRequired()
+                    || map.containsKey(child.getName())
+                    || child.getChoiceGroup() != null;
             if (!must) {
                 continue;
             }

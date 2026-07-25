@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>XSD → XML Generator</title>
+    <script src="/vendor/tailwindcss-3.4.17.js"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['"Segoe UI"', 'system-ui', 'sans-serif'],
+                        mono: ['"JetBrains Mono"', 'Consolas', 'monospace']
+                    },
+                    colors: {
+                        ink: '#0f172a',
+                        mist: '#f1f5f9',
+                        accent: '#0ea5e9',
+                        accentDark: '#0284c7'
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            background:
+                radial-gradient(circle at 10% 10%, rgba(14, 165, 233, 0.12), transparent 35%),
+                radial-gradient(circle at 90% 0%, rgba(2, 132, 199, 0.10), transparent 30%),
+                linear-gradient(180deg, #f8fafc 0%, #e2e8f0 100%);
+            min-height: 100vh;
+        }
+        .drop-zone.dragover {
+            border-color: #0ea5e9;
+            background-color: rgba(14, 165, 233, 0.08);
+        }
+        pre.xml-preview {
+            max-height: 28rem;
+            overflow: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .field-card {
+            border-left: 3px solid #0ea5e9;
+        }
+        .nested-card {
+            border-left: 3px solid #64748b;
+        }
+    </style>
+</head>
+<body class="text-ink font-sans">
+<main class="max-w-6xl mx-auto px-4 py-10">
+    <header class="mb-8">
+        <p class="text-accentDark text-sm font-semibold tracking-wide uppercase mb-2">Schema-driven XML builder</p>
+        <h1 class="text-3xl md:text-4xl font-bold text-slate-900">XSD → XML Generator</h1>
+        <p class="mt-3 text-slate-600 max-w-2xl">
+            Upload an XML Schema, fill in the generated form, then preview and download a compliant XML document.
+        </p>
+    </header>
+
+    <!-- Step 1: Upload -->
+    <section class="bg-white/90 backdrop-blur rounded-2xl shadow-sm border border-slate-200 p-6 mb-6">
+        <div class="flex items-center justify-between gap-3 mb-4">
+            <h2 class="text-lg font-semibold">1. Upload XSD</h2>
+            <span id="fileBadge" class="hidden text-xs px-2.5 py-1 rounded-full bg-sky-100 text-sky-800"></span>
+        </div>
+
+        <form id="uploadForm" class="space-y-4">
+            <label id="dropZone"
+                   class="drop-zone flex flex-col items-center justify-center gap-2 border-2 border-dashed border-slate-300 rounded-xl p-8 cursor-pointer hover:border-accent transition">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-10 w-10 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                          d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/>
+                </svg>
+                <span class="text-sm text-slate-600">Drag &amp; drop an <strong>.xsd</strong> file here, or click to browse</span>
+                <!-- No MIME accept filter: macOS often maps .xsd to unknown types and browsers hide them -->
+                <input id="xsdFile" name="file" type="file" class="hidden"/>
+                <span id="selectedFileName" class="text-xs text-slate-400">No file selected</span>
+            </label>
+
+            <div class="flex flex-wrap items-center gap-3">
+                <button type="submit"
+                        class="inline-flex items-center gap-2 bg-accent hover:bg-accentDark text-white font-medium px-5 py-2.5 rounded-lg transition disabled:opacity-50"
+                        id="uploadBtn">
+                    Parse Schema
+                </button>
+                <button type="button" id="resetBtn"
+                        class="text-sm text-slate-500 hover:text-slate-800 underline-offset-2 hover:underline">
+                    Reset
+                </button>
+                <p id="uploadStatus" class="text-sm text-slate-500"></p>
+            </div>
+        </form>
+    </section>
+
+    <!-- Step 2: Dynamic Form -->
+    <section id="formSection" class="hidden bg-white/90 backdrop-blur rounded-2xl shadow-sm border border-slate-200 p-6 mb-6">
+        <div class="flex flex-wrap items-end justify-between gap-4 mb-5">
+            <div>
+                <h2 class="text-lg font-semibold">2. Provide Values</h2>
+                <p class="text-sm text-slate-500 mt-1">Choose how to populate the XML — type values yourself, or generate random valid sample data.</p>
+            </div>
+            <div id="rootSelectorWrap" class="hidden">
+                <label for="rootSelector" class="block text-xs font-medium text-slate-500 mb-1">Root element</label>
+                <select id="rootSelector" class="border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white"></select>
+            </div>
+        </div>
+
+        <div class="grid sm:grid-cols-2 gap-3 mb-6" id="modeChooser">
+            <button type="button" id="modeManualBtn"
+                    class="mode-card text-left rounded-xl border-2 border-sky-500 bg-sky-50 p-4 transition hover:border-sky-600">
+                <p class="font-semibold text-slate-900">Enter values manually</p>
+                <p class="text-xs text-slate-500 mt-1">Fill the form fields yourself, then generate XML.</p>
+            </button>
+            <button type="button" id="modeRandomBtn"
+                    class="mode-card text-left rounded-xl border-2 border-slate-200 bg-white p-4 transition hover:border-slate-400">
+                <p class="font-semibold text-slate-900">Generate with random valid values</p>
+                <p class="text-xs text-slate-500 mt-1">Auto-fill type-safe sample data (respects enums, dates, numbers, required fields).</p>
+            </button>
+        </div>
+
+        <div id="manualHint" class="mb-4 text-sm text-slate-500">
+            Fields marked with <span class="text-rose-600">*</span> are required (<code>minOccurs &gt;= 1</code>).
+        </div>
+        <div id="randomHint" class="hidden mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+            Random mode will fill the form with valid sample values. You can still edit any field before generating XML.
+        </div>
+
+        <div class="mb-5 grid gap-3 rounded-xl border border-slate-200 bg-slate-50 p-4 sm:grid-cols-2">
+            <label class="flex items-start gap-3 text-sm text-slate-700">
+                <input id="includeOptionalTags" type="checkbox" checked
+                       class="mt-0.5 h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-400"/>
+                <span>
+                    <span class="block font-medium text-slate-800">Include optional tags</span>
+                    <span class="block text-xs text-slate-500">Include elements and attributes whose <code>minOccurs</code> or <code>use</code> is optional.</span>
+                </span>
+            </label>
+            <label for="countryCode" class="block text-sm text-slate-700">
+                <span class="block font-medium text-slate-800">Country code for generated values</span>
+                <input id="countryCode" type="text" maxlength="2" pattern="[A-Za-z]{2}"
+                       placeholder="e.g. HK"
+                       class="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 uppercase focus:outline-none focus:ring-2 focus:ring-sky-300"/>
+                <span id="countryContextHint" class="mt-1 block text-xs text-slate-500">Country and currency fields will use this context (HK → HKD).</span>
+            </label>
+        </div>
+
+        <div class="mb-5 rounded-xl border border-sky-200 bg-sky-50 p-4">
+            <p class="font-medium text-slate-800">Payment values</p>
+            <p class="mb-3 text-xs text-slate-500">Values are copied into matching creditor/debtor agent and account identifier tags (for example BICFI and IBAN).</p>
+            <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                <label class="block text-sm text-slate-700">
+                    <span class="font-medium">CdtrAgt</span>
+                    <input id="cdtrAgtValue" type="text" placeholder="Creditor agent BIC"
+                           class="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 focus:outline-none focus:ring-2 focus:ring-sky-300"/>
+                </label>
+                <label class="block text-sm text-slate-700">
+                    <span class="font-medium">DbtrAgt</span>
+                    <input id="dbtrAgtValue" type="text" placeholder="Debtor agent BIC"
+                           class="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 focus:outline-none focus:ring-2 focus:ring-sky-300"/>
+                </label>
+                <label class="block text-sm text-slate-700">
+                    <span class="font-medium">DbtrAcct</span>
+                    <input id="dbtrAcctValue" type="text" placeholder="Debtor account / IBAN"
+                           class="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 focus:outline-none focus:ring-2 focus:ring-sky-300"/>
+                </label>
+                <label class="block text-sm text-slate-700">
+                    <span class="font-medium">CdtrAcct</span>
+                    <input id="cdtrAcctValue" type="text" placeholder="Creditor account / IBAN"
+                           class="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 focus:outline-none focus:ring-2 focus:ring-sky-300"/>
+                </label>
+            </div>
+        </div>
+
+        <form id="dynamicForm" class="space-y-4"></form>
+
+        <div class="mt-6 flex flex-wrap gap-3">
+            <button type="button" id="fillRandomBtn"
+                    class="hidden border border-amber-500 text-amber-800 hover:bg-amber-50 font-medium px-5 py-2.5 rounded-lg transition">
+                Fill random values
+            </button>
+            <button type="button" id="generateBtn"
+                    class="bg-slate-900 hover:bg-slate-700 text-white font-medium px-5 py-2.5 rounded-lg transition">
+                Generate &amp; Validate XML
+            </button>
+            <button type="button" id="downloadBtn" disabled
+                    class="bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-300 text-white font-medium px-5 py-2.5 rounded-lg transition">
+                Download XML File
+            </button>
+        </div>
+        <p id="generateStatus" class="mt-3 text-sm text-slate-500"></p>
+        <div id="validationErrors" class="hidden mt-3 rounded-lg border border-rose-200 bg-rose-50 p-3">
+            <p class="text-sm font-medium text-rose-700 mb-2">XSD validation failed</p>
+            <ul id="validationErrorList" class="list-disc list-inside text-xs text-rose-700 space-y-1"></ul>
+        </div>
+    </section>
+
+    <!-- Step 3: Preview -->
+    <section id="previewSection" class="hidden bg-slate-900 rounded-2xl shadow-lg border border-slate-800 p-6">
+        <div class="flex items-center justify-between mb-4">
+            <h2 class="text-lg font-semibold text-white">3. XML Preview</h2>
+            <button type="button" id="copyBtn"
+                    class="text-xs text-sky-300 hover:text-white border border-sky-700/60 px-3 py-1.5 rounded-md">
+                Copy
+            </button>
+        </div>
+        <pre id="xmlPreview" class="xml-preview font-mono text-sm text-emerald-300 leading-relaxed"></pre>
+    </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

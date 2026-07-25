@@ -1,0 +1,25 @@
+# Maven
+target/
+*.jar
+*.jar.original
+*.war
+*.class
+
+# Share / packaging artifacts
+dist/
+dist-safe/
+*.zip
+payment-file-creator-safe.txt
+payment-file-creator-share.zip
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
+*.swp
+*.log
+
+# Local env
+.env
+*.local

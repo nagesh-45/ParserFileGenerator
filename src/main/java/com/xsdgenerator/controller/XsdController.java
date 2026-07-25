@@ -34,6 +34,14 @@ public class XsdController {
         return "index";
     }
 
+    @GetMapping(value = "/version", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public Map<String, Object> version() {
+        Map<String, Object> body = new HashMap<>();
+        body.put("buildId", com.xsdgenerator.AppBuild.ID);
+        return body;
+    }
+
     @PostMapping(value = "/upload-xsd", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ResponseEntity<Map<String, Object>> uploadXsd(@RequestParam("file") MultipartFile file) {
@@ -77,7 +85,7 @@ public class XsdController {
             response.put("fileName", parsed.fileName());
             response.put("roots", parsed.roots());
             response.put("rootCount", parsed.roots().size());
-            response.put("buildId", "2026-07-25e");
+            response.put("buildId", com.xsdgenerator.AppBuild.ID);
             if (!parsed.roots().isEmpty()) {
                 var doc = parsed.roots().stream()
                         .filter(r -> "Document".equals(r.getName()))
@@ -193,7 +201,7 @@ public class XsdController {
     private Map<String, Object> validationError(XmlValidationException ex) {
         Map<String, Object> body = error(ex.getMessage());
         body.put("errors", ex.getErrors());
-        body.put("buildId", "2026-07-25e");
+        body.put("buildId", com.xsdgenerator.AppBuild.ID);
         return body;
     }
 

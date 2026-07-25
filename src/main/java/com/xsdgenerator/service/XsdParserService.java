@@ -1,5 +1,6 @@
 package com.xsdgenerator.service;
 
+import com.xsdgenerator.AppBuild;
 import com.xsdgenerator.dto.SchemaField;
 import com.xsdgenerator.exception.XmlValidationException;
 import org.apache.xerces.impl.xs.XMLSchemaLoader;
@@ -258,8 +259,12 @@ public class XsdParserService {
                 preview = preview.substring(0, 280) + "...";
             }
             withPreview.add("generatedXmlPreview: " + preview);
+            withPreview.add("appBuild: " + AppBuild.ID + " | schemaFile: " + stored.fileName()
+                    + " | rootChildren: "
+                    + (rootSchema.getChildren() == null ? 0 : rootSchema.getChildren().size()));
             throw new XmlValidationException(
-                    "Generated XML is not valid against the uploaded XSD (" + errors.size() + " error(s))",
+                    "Generated XML is not valid against the uploaded XSD (" + errors.size() + " error(s))"
+                            + " [build " + AppBuild.ID + "]",
                     withPreview);
         }
         return xml;

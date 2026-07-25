@@ -37,6 +37,7 @@ class Pacs008UploadGenerateTest {
         MvcResult upload = mockMvc.perform(multipart("/upload-xsd").file(file))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.buildId").value(com.xsdgenerator.AppBuild.ID))
                 .andExpect(jsonPath("$.documentChildCount").value(1))
                 .andExpect(jsonPath("$.documentChildNames[0]").value("FIToFICstmrCdtTrf"))
                 .andReturn();

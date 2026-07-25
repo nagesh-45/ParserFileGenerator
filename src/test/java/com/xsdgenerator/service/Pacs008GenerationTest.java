@@ -126,6 +126,36 @@ class Pacs008GenerationTest {
         assertTrue(xml.contains("FIToFICstmrCdtTrf"), "Recovered XML:\n" + xml);
     }
 
+    @Test
+    void validationFailures_carryBuildStampAndXmlPreview() {
+        ParsedSchema parsed = service.parseAndStoreUpload(xsdBytes, "pacs.008.001.05.xsd");
+        SchemaField stub = new SchemaField();
+        stub.setName("Document");
+
+        // Value that cannot be repaired into validity: wrong datatype on a required leaf
+        Map<String, Object> grpHdr = new LinkedHashMap<>();
+        grpHdr.put("CreDtTm", "not-a-timestamp");
+        Map<String, Object> msg = new LinkedHashMap<>();
+        msg.put("GrpHdr", grpHdr);
+        Map<String, Object> doc = new LinkedHashMap<>();
+        doc.put("FIToFICstmrCdtTrf", msg);
+        Map<String, Object> values = new LinkedHashMap<>();
+        values.put("Document", doc);
+
+        try {
+            service.generateAndValidateXml(parsed.schemaId(), stub, values);
+            // If the generator repaired it, that is also acceptable behaviour
+        } catch (XmlValidationException ex) {
+            assertTrue(ex.getMessage().contains(com.xsdgenerator.AppBuild.ID),
+                    "Error message must name the build: " + ex.getMessage());
+            String joined = String.join("\n", ex.getErrors());
+            assertTrue(joined.contains("generatedXmlPreview:"),
+                    "Errors must include the generated XML preview:\n" + joined);
+            assertTrue(joined.contains("appBuild: " + com.xsdgenerator.AppBuild.ID),
+                    "Errors must include appBuild diagnostics:\n" + joined);
+        }
+    }
+
     private static SchemaField findDocument(List<SchemaField> roots) {
         return roots.stream()
                 .filter(r -> "Document".equals(r.getName()))

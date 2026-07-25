@@ -552,7 +552,11 @@
         }
 
         const input = document.createElement('input');
-        if (type === 'integer' || type === 'decimal') {
+        // Prefer text when a pattern exists so values like "072" or IBAN stay intact
+        // (Windows Chrome silently clears invalid number/date values).
+        if (field.pattern) {
+            input.type = 'text';
+        } else if (type === 'integer' || type === 'decimal') {
             input.type = 'number';
             if (type === 'integer') input.step = '1';
             else input.step = 'any';
@@ -626,13 +630,33 @@
         applyOptionalTagVisibility();
         // 3) Fill every visible (non-disabled) control from its own stamped XSD metadata
         fillAllVisibleControls(els.dynamicForm);
+        // 4) Windows/Chromium can silently reject invalid number/date/select values —
+        //    sweep any blanks that remain and force a stuck-safe value.
+        fillAnyRemainingBlankControls(root, els.dynamicForm);
+        forceFillStillBlankControls(els.dynamicForm);
+        applyCountryContextToForm();
+        applyPaymentContextToForm();
     }
 
     function applyOptionalTagVisibility() {
         const include = els.includeOptionalTags.checked;
         els.dynamicForm.querySelectorAll('[data-optional-tag="1"]').forEach(host => {
+            // Never re-enable controls inside a deselected xs:choice branch
+            if (host.closest('[data-choice-selected="0"]') || host.dataset.choiceSelected === '0') {
+                host.classList.add('hidden');
+                host.querySelectorAll('input, select, button').forEach(control => {
+                    control.disabled = true;
+                    if (control.type === 'checkbox') control.checked = false;
+                    else if (control.tagName !== 'BUTTON') control.value = '';
+                });
+                return;
+            }
             host.classList.toggle('hidden', !include);
             host.querySelectorAll('input, select, button').forEach(control => {
+                if (control.closest('[data-choice-selected="0"]')) {
+                    control.disabled = true;
+                    return;
+                }
                 control.disabled = !include;
                 if (!include) {
                     if (control.type === 'checkbox') control.checked = false;
@@ -641,6 +665,13 @@
             });
         });
         els.dynamicForm.querySelectorAll('[data-optional-attribute="1"]').forEach(input => {
+            if (input.closest('[data-choice-selected="0"]')) {
+                const host = input.parentElement;
+                if (host) host.classList.add('hidden');
+                input.disabled = true;
+                input.value = '';
+                return;
+            }
             const host = input.parentElement;
             if (host) host.classList.toggle('hidden', !include);
             input.disabled = !include;
@@ -702,6 +733,7 @@
         controls.forEach(el => {
             if (el.disabled) return;
             if (el.closest('[data-choice-selected="0"]')) return;
+            if (el.closest('.hidden')) return;
 
             if (el.type === 'checkbox') {
                 writeControl(el, 'true');
@@ -712,9 +744,69 @@
             // Always overwrite in random mode so previous partial fills can't linger
             const meta = metaFromControl(el);
             writeControl(el, randomPrimitive(meta));
-            filled++;
+            // If the browser rejected the value (common on Windows for number/date/select), retry
+            if (!isControlFilled(el)) {
+                writeControl(el, safeFallbackValue(el, meta));
+            }
+            if (isControlFilled(el)) filled++;
         });
         return filled;
+    }
+
+    function isControlFilled(el) {
+        if (!el || el.disabled) return true;
+        if (el.type === 'checkbox') return true;
+        return String(el.value || '').trim() !== '';
+    }
+
+    function safeFallbackValue(el, meta) {
+        if (el.tagName === 'SELECT') {
+            const opts = Array.from(el.options).map(o => o.value).filter(v => v !== '');
+            if (opts.length) return opts[0];
+        }
+        const type = (meta && meta.type ? meta.type : el.type || 'string').toLowerCase();
+        if (type === 'number' || type === 'integer' || el.type === 'number') {
+            return randomBoundedInteger(meta || {});
+        }
+        if (type === 'decimal') return randomBoundedDecimal(meta || {});
+        if (type === 'date' || el.type === 'date') return formatDate(randomDateNearToday(30));
+        if (type === 'datetime' || el.type === 'datetime-local') {
+            const d = randomDateNearToday(30);
+            return `${formatDate(d)}T12:00`;
+        }
+        if (type === 'time' || el.type === 'time') return '12:00';
+        if (type === 'gyearmonth' || el.type === 'month') {
+            return `${randInt(2020, 2030)}-${String(randInt(1, 12)).padStart(2, '0')}`;
+        }
+        if (meta && meta.pattern) return valueFromPattern(meta.pattern, meta);
+        if (meta && (meta.length || meta.maxLength)) {
+            const len = meta.length || Math.min(Number(meta.maxLength), 4);
+            return randomAlphaNum(len, true);
+        }
+        return 'X' + randInt(10, 99);
+    }
+
+    /** Final sweep used on Windows where some controls stay blank after the first pass. */
+    function forceFillStillBlankControls(container) {
+        Array.from(container.querySelectorAll('input, select')).forEach(el => {
+            if (el.disabled) return;
+            if (el.closest('[data-choice-selected="0"]')) return;
+            if (el.closest('.hidden')) return;
+            if (isControlFilled(el) && el.type !== 'checkbox') return;
+            if (el.type === 'checkbox') {
+                writeControl(el, 'true');
+                return;
+            }
+            const meta = metaFromControl(el);
+            writeControl(el, randomPrimitive(meta));
+            if (!isControlFilled(el)) writeControl(el, safeFallbackValue(el, meta));
+            // Last resort: switch number/date inputs to text so the value can stick
+            if (!isControlFilled(el) && el.tagName === 'INPUT' && el.type !== 'text' && el.type !== 'checkbox') {
+                const v = safeFallbackValue(el, meta);
+                try { el.type = 'text'; } catch (_) { /* ignore */ }
+                writeControl(el, v);
+            }
+        });
     }
 
     function metaFromControl(el) {
@@ -1384,7 +1476,27 @@
             if (el.type === 'datetime-local' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(v)) {
                 v = v.slice(0, 16);
             }
+            if (el.type === 'month' && /^\d{4}-\d{2}/.test(v)) {
+                v = v.slice(0, 7);
+            }
+            if (el.type === 'time' && /^\d{2}:\d{2}/.test(v)) {
+                v = v.slice(0, 5);
+            }
+            if (el.tagName === 'SELECT') {
+                const opts = Array.from(el.options).map(o => o.value);
+                if (v && opts.indexOf(v) === -1) {
+                    // Country/payment override may not be in enum — pick a valid option instead of leaving blank
+                    const nonempty = opts.filter(o => o !== '');
+                    v = nonempty.length ? nonempty[0] : '';
+                }
+            }
+            if (el.type === 'number') {
+                // Strip anything browsers reject (commas, trailing letters)
+                const num = String(v).replace(/[^0-9.+-]/g, '');
+                v = num === '' || num === '.' || num === '-' || num === '+' ? '1' : num;
+            }
             el.value = v;
+            // If the browser rejected it, leave empty so the blank-fill pass can recover
         }
         el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));

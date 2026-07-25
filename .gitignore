@@ -6,6 +6,8 @@ target/
 *.class
 # Keep the committed Maven Wrapper jar (needed to build without a local Maven install)
 !.mvn/wrapper/maven-wrapper.jar
+# Keep the prebuilt runnable app so Java-only machines need no build step
+!release/payment-file-creator.jar
 
 # Share / packaging artifacts
 dist/

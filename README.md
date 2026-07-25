@@ -4,10 +4,28 @@ Spring Boot web app that uploads an XSD, builds a dynamic form from the schema, 
 
 Repository: [nagesh-45/ParserFileGenerator](https://github.com/nagesh-45/ParserFileGenerator)
 
+## Quick start (no build needed)
+
+A prebuilt runnable application is committed in [`release/`](release). Only Java 17+ is required.
+
+1. Download or clone the repository.
+2. Open the `release` folder.
+3. Start it:
+   - **Windows** — double-click `START-WINDOWS.bat`
+   - **macOS / Linux** — double-click `START-MAC-LINUX.command`
+     (first time only: `chmod +x START-MAC-LINUX.command`)
+4. The browser opens at [http://localhost:8080](http://localhost:8080).
+
+Or run it directly from that folder:
+
+```bash
+java -jar payment-file-creator.jar
+```
+
 ## Requirements
 
+- To run the prebuilt application in `release/`: Java 17+ only
 - To build from source: Java 17+ (Maven is not required, use the bundled wrapper)
-- To run the packaged application: Java 17+ only
 
 ## Build and run
 

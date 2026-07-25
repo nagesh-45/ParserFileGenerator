@@ -218,11 +218,13 @@ public class XsdParserService {
      */
     public String generateAndValidateXml(String schemaId, SchemaField clientSchema, Map<String, Object> values) {
         StoredSchema stored = requireStoredSchema(schemaId);
-        SchemaField rootSchema = resolveRootSchema(stored, clientSchema);
+        SchemaField rootSchema = ensureMaterializedRoot(schemaId, stored, resolveRootSchema(stored, clientSchema));
         Map<String, Object> enriched = enrichValuesForGeneration(rootSchema, values);
         String xml = generateXml(rootSchema, enriched);
 
         List<String> errors = collectValidationErrors(xml, stored);
+        // Re-read store in case rematerialize/graft updated roots
+        stored = requireStoredSchema(schemaId);
         for (int attempt = 0; !errors.isEmpty() && attempt < MAX_REPAIR_ATTEMPTS; attempt++) {
             Object repaired = repairOnce(stored, rootSchema, enriched.get(rootSchema.getName()), errors);
             if (repaired == null) {
@@ -239,6 +241,43 @@ public class XsdParserService {
                     errors);
         }
         return xml;
+    }
+
+    /**
+     * Re-parses the stored XSD when the Document tree has no children (imports unresolved,
+     * truncated mapping, etc.) so FIToFICstmrCdtTrf can still be generated.
+     */
+    private SchemaField ensureMaterializedRoot(String schemaId, StoredSchema stored, SchemaField root) {
+        if (root == null) {
+            return null;
+        }
+        if (root.getChildren() != null && !root.getChildren().isEmpty()) {
+            return root;
+        }
+        try {
+            List<SchemaField> refreshed = parseXsd(stored.bytes(), stored.fileName(), stored.files());
+            for (SchemaField candidate : refreshed) {
+                if (root.getName() != null && root.getName().equals(candidate.getName())
+                        && candidate.getChildren() != null && !candidate.getChildren().isEmpty()) {
+                    List<SchemaField> updated = new ArrayList<>();
+                    for (SchemaField existing : stored.roots()) {
+                        if (existing.getName() != null && existing.getName().equals(candidate.getName())) {
+                            updated.add(candidate);
+                        } else {
+                            updated.add(existing);
+                        }
+                    }
+                    schemaStore.put(schemaId,
+                            new StoredSchema(stored.fileName(), stored.bytes(), stored.files(), updated));
+                    log.info("Rematerialized empty root '{}' with {} child element(s)",
+                            candidate.getName(), candidate.getChildren().size());
+                    return candidate;
+                }
+            }
+        } catch (Exception ex) {
+            log.warn("Failed to rematerialize root '{}': {}", root.getName(), ex.getMessage());
+        }
+        return root;
     }
 
     /**
@@ -868,8 +907,21 @@ public class XsdParserService {
         if (field.getEnumerations() != null && !field.getEnumerations().isEmpty()) {
             return field.getEnumerations().get(0);
         }
-        if ("Ccy".equalsIgnoreCase(name) || typeName.toLowerCase(Locale.ROOT).contains("currency")) {
+        String typeNameLower = typeName.toLowerCase(Locale.ROOT);
+        // Currency CODES only — do not treat ActiveCurrencyAndAmount / similar as currency codes
+        if ("Ccy".equalsIgnoreCase(name)
+                || "Currency".equalsIgnoreCase(name)
+                || typeNameLower.endsWith("currencycode")
+                || (typeNameLower.contains("currency") && !typeNameLower.contains("amount"))) {
             return "USD";
+        }
+        if (typeNameLower.contains("amount") || name.toLowerCase(Locale.ROOT).endsWith("amt")
+                || "decimal".equals(type)) {
+            int frac = field.getFractionDigits() != null ? field.getFractionDigits() : 2;
+            if (frac <= 0) {
+                return "1";
+            }
+            return "1." + "0".repeat(Math.min(frac, 5));
         }
         if ("Ctry".equalsIgnoreCase(name) || "CtryOfRes".equalsIgnoreCase(name)
                 || typeName.toLowerCase(Locale.ROOT).contains("country")) {

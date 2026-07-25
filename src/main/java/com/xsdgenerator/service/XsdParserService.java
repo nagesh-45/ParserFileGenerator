@@ -53,6 +53,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -60,6 +61,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -76,6 +79,11 @@ public class XsdParserService {
     private static final String XSD_NS = XMLConstants.W3C_XML_SCHEMA_NS_URI;
     /** Prevents StackOverflow on recursive ISO 20022 types (common in pacs/pain/camt). */
     private static final int MAX_MAPPING_DEPTH = 18;
+    /** Bounds the validate → fill missing element → re-validate loop. */
+    private static final int MAX_REPAIR_ATTEMPTS = 40;
+    private static final Pattern EXPECTED_CONTENT = Pattern.compile("One of '\\{([^}]*)\\}' is expected");
+    private static final Pattern INVALID_CONTENT =
+            Pattern.compile("Invalid content was found starting with element '([^']*)'");
 
     private final ConcurrentHashMap<String, StoredSchema> schemaStore = new ConcurrentHashMap<>();
     private final AtomicInteger choiceCounter = new AtomicInteger();
@@ -192,6 +200,14 @@ public class XsdParserService {
             return aDoc ? -1 : 1;
         });
 
+        for (SchemaField root : roots) {
+            if ("Document".equals(root.getName())
+                    && (root.getChildren() == null || root.getChildren().isEmpty())) {
+                log.warn("Document root from '{}' has no child elements — imports may be unresolved. "
+                        + "Upload a ZIP containing the main XSD plus its imported schemas.", fileName);
+            }
+        }
+
         log.info("Parsed XSD '{}': {} root element(s)", fileName, roots.size());
         return roots;
     }
@@ -205,12 +221,237 @@ public class XsdParserService {
         SchemaField rootSchema = resolveRootSchema(stored, clientSchema);
         Map<String, Object> enriched = enrichValuesForGeneration(rootSchema, values);
         String xml = generateXml(rootSchema, enriched);
-        validateXmlAgainstXsd(xml, stored);
+
+        List<String> errors = collectValidationErrors(xml, stored);
+        for (int attempt = 0; !errors.isEmpty() && attempt < MAX_REPAIR_ATTEMPTS; attempt++) {
+            Object repaired = repairOnce(stored, rootSchema, enriched.get(rootSchema.getName()), errors);
+            if (repaired == null) {
+                break;
+            }
+            enriched.put(rootSchema.getName(), repaired);
+            xml = generateXml(rootSchema, enriched);
+            errors = collectValidationErrors(xml, stored);
+        }
+
+        if (!errors.isEmpty()) {
+            throw new XmlValidationException(
+                    "Generated XML is not valid against the uploaded XSD (" + errors.size() + " error(s))",
+                    errors);
+        }
         return xml;
     }
 
+    /**
+     * Applies one schema-guided fix for the reported errors: drop content the schema rejects,
+     * otherwise add the element Xerces says is missing.
+     */
+    private Object repairOnce(StoredSchema stored, SchemaField rootSchema, Object rootValue, List<String> errors) {
+        Set<String> unexpected = matchedElementNames(errors, INVALID_CONTENT);
+        if (!unexpected.isEmpty()) {
+            Object pruned = removeElements(rootSchema, rootValue, unexpected);
+            if (pruned != null) {
+                log.info("Removed content rejected by the XSD: {}", unexpected);
+                return pruned;
+            }
+        }
+        Set<String> expected = matchedElementNames(errors, EXPECTED_CONTENT);
+        if (expected.isEmpty()) {
+            return null;
+        }
+        graftMissingChildrenFromRoots(stored, rootSchema, expected);
+        Object filled = forceFillExpected(rootSchema, rootValue, expected);
+        if (filled != null) {
+            log.info("Filled element(s) required by the XSD: {}", expected);
+        }
+        return filled;
+    }
+
+    /**
+     * When the mapped Document tree is missing a child the XSD expects (e.g. FIToFICstmrCdtTrf),
+     * graft it from another global root of the same name if available.
+     */
+    private void graftMissingChildrenFromRoots(StoredSchema stored, SchemaField parent, Set<String> expected) {
+        if (stored == null || stored.roots() == null || parent == null || parent.getChildren() == null) {
+            return;
+        }
+        for (String name : expected) {
+            boolean present = parent.getChildren().stream().anyMatch(c -> name.equals(c.getName()));
+            if (present) {
+                continue;
+            }
+            for (SchemaField root : stored.roots()) {
+                if (name.equals(root.getName()) && root != parent) {
+                    SchemaField graft = copyShallowForGraft(root);
+                    graft.setRequired(true);
+                    graft.setMinOccurs(1);
+                    parent.getChildren().add(graft);
+                    log.info("Grafted missing child '{}' onto '{}' from global root", name, parent.getName());
+                    break;
+                }
+            }
+        }
+    }
+
+    private SchemaField copyShallowForGraft(SchemaField source) {
+        SchemaField copy = new SchemaField();
+        copy.setName(source.getName());
+        copy.setNamespace(source.getNamespace());
+        copy.setType(source.getType());
+        copy.setTypeName(source.getTypeName());
+        copy.setComplex(source.isComplex());
+        copy.setRequired(source.isRequired());
+        copy.setMinOccurs(source.getMinOccurs());
+        copy.setMaxOccurs(source.getMaxOccurs());
+        copy.setXpath(source.getXpath());
+        copy.setDocumentation(source.getDocumentation());
+        copy.setPattern(source.getPattern());
+        copy.setLength(source.getLength());
+        copy.setMinLength(source.getMinLength());
+        copy.setMaxLength(source.getMaxLength());
+        copy.setFractionDigits(source.getFractionDigits());
+        copy.setTotalDigits(source.getTotalDigits());
+        if (source.getEnumerations() != null) {
+            copy.setEnumerations(new ArrayList<>(source.getEnumerations()));
+        }
+        if (source.getAttributes() != null) {
+            copy.getAttributes().addAll(source.getAttributes());
+        }
+        if (source.getChildren() != null) {
+            copy.getChildren().addAll(source.getChildren());
+        }
+        return copy;
+    }
+
+    /**
+     * Pulls element names out of Xerces messages, e.g.
+     * {@code One of '{"urn:...":FIToFICstmrCdtTrf}' is expected}.
+     */
+    private Set<String> matchedElementNames(List<String> errors, Pattern pattern) {
+        Set<String> names = new LinkedHashSet<>();
+        for (String error : errors) {
+            if (error == null) {
+                continue;
+            }
+            Matcher matcher = pattern.matcher(error);
+            while (matcher.find()) {
+                for (String raw : matcher.group(1).split(",")) {
+                    String name = raw.trim();
+                    int colon = name.lastIndexOf(':');
+                    if (colon >= 0) {
+                        name = name.substring(colon + 1);
+                    }
+                    name = name.replace("\"", "").replace("{", "").replace("}", "").trim();
+                    if (!name.isEmpty()) {
+                        names.add(name);
+                    }
+                }
+            }
+        }
+        return names;
+    }
+
+    /**
+     * @return an updated copy of {@code value} with the first matching element dropped,
+     *         or {@code null} when none of the names are present
+     */
+    private Object removeElements(SchemaField field, Object value, Set<String> names) {
+        if (field == null || !field.isComplex() || field.getChildren() == null) {
+            return null;
+        }
+        Map<String, Object> values = asMap(value);
+        if (values == null) {
+            return null;
+        }
+        for (SchemaField child : field.getChildren()) {
+            if (names.contains(child.getName()) && values.containsKey(child.getName())
+                    && !isEffectivelyRequired(child)) {
+                values.remove(child.getName());
+                return values;
+            }
+        }
+        for (SchemaField child : field.getChildren()) {
+            Object childValue = values.get(child.getName());
+            if (childValue instanceof List<?> list) {
+                List<Object> items = new ArrayList<>(list);
+                for (int i = 0; i < items.size(); i++) {
+                    Object pruned = removeElements(child, items.get(i), names);
+                    if (pruned != null) {
+                        items.set(i, pruned);
+                        values.put(child.getName(), items);
+                        return values;
+                    }
+                }
+            } else if (childValue != null) {
+                Object pruned = removeElements(child, childValue, names);
+                if (pruned != null) {
+                    values.put(child.getName(), pruned);
+                    return values;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Adds a schema-valid value for the first expected child found anywhere in the tree.
+     * Guards against schemas where an element is mandatory in ways the parsed model missed.
+     *
+     * @return an updated copy of {@code value}, or {@code null} when nothing could be filled
+     */
+    private Object forceFillExpected(SchemaField field, Object value, Set<String> expected) {
+        if (field == null || !field.isComplex() || field.getChildren() == null || field.getChildren().isEmpty()) {
+            return null;
+        }
+        Map<String, Object> values = asMap(value);
+        if (values == null) {
+            values = new LinkedHashMap<>();
+        }
+
+        for (SchemaField child : field.getChildren()) {
+            if (!expected.contains(child.getName())) {
+                continue;
+            }
+            Object existing = values.get(child.getName());
+            if (existing != null && !shouldOmit(child, existing)) {
+                continue;
+            }
+            if (child.getChoiceGroup() != null) {
+                for (SchemaField sibling : field.getChildren()) {
+                    if (sibling != child && child.getChoiceGroup().equals(sibling.getChoiceGroup())) {
+                        values.remove(sibling.getName());
+                    }
+                }
+            }
+            Object filled = enrichNode(child, null, true);
+            values.put(child.getName(),
+                    child.getMaxOccurs() == -1 || child.getMaxOccurs() > 1 ? List.of(filled) : filled);
+            return values;
+        }
+
+        for (SchemaField child : field.getChildren()) {
+            Object childValue = values.get(child.getName());
+            if (childValue instanceof List<?> list) {
+                List<Object> items = new ArrayList<>(list);
+                for (int i = 0; i < items.size(); i++) {
+                    Object repaired = forceFillExpected(child, items.get(i), expected);
+                    if (repaired != null) {
+                        items.set(i, repaired);
+                        values.put(child.getName(), items);
+                        return values;
+                    }
+                }
+            } else if (childValue != null) {
+                Object repaired = forceFillExpected(child, childValue, expected);
+                if (repaired != null) {
+                    values.put(child.getName(), repaired);
+                    return values;
+                }
+            }
+        }
+        return null;
+    }
+
     public String generateAndValidateXml(String schemaId, String rootName, Map<String, Object> values) {
-        StoredSchema stored = requireStoredSchema(schemaId);
         SchemaField stub = new SchemaField();
         stub.setName(rootName);
         return generateAndValidateXml(schemaId, stub, values);
@@ -273,6 +514,15 @@ public class XsdParserService {
     }
 
     private void validateXmlAgainstXsd(String xml, StoredSchema stored) {
+        List<String> errors = collectValidationErrors(xml, stored);
+        if (!errors.isEmpty()) {
+            throw new XmlValidationException(
+                    "Generated XML is not valid against the uploaded XSD (" + errors.size() + " error(s))",
+                    errors);
+        }
+    }
+
+    private List<String> collectValidationErrors(String xml, StoredSchema stored) {
         if (xml == null || xml.isBlank()) {
             throw new IllegalArgumentException("Generated XML is empty");
         }
@@ -299,12 +549,7 @@ public class XsdParserService {
         } catch (Exception ex) {
             throw new IllegalStateException("Unable to validate XML against XSD: " + ex.getMessage(), ex);
         }
-
-        if (!errors.isEmpty()) {
-            throw new XmlValidationException(
-                    "Generated XML is not valid against the uploaded XSD (" + errors.size() + " error(s))",
-                    errors);
-        }
+        return errors;
     }
 
     private StoredSchema requireStoredSchema(String schemaId) {
@@ -496,9 +741,16 @@ public class XsdParserService {
     }
 
     private Object enrichNode(SchemaField field, Object value) {
+        return enrichNode(field, value, false);
+    }
+
+    /**
+     * @param force treat this element as mandatory even when the parsed model marks it optional
+     */
+    private Object enrichNode(SchemaField field, Object value, boolean force) {
         if (field.isAttribute()) {
             if (value == null || String.valueOf(value).isBlank()) {
-                return isEffectivelyRequired(field) ? defaultLexicalValue(field) : value;
+                return force || isEffectivelyRequired(field) ? defaultLexicalValue(field) : value;
             }
             return value;
         }
@@ -510,7 +762,7 @@ public class XsdParserService {
                 Map<String, Object> wrap = valueMap != null ? new LinkedHashMap<>(valueMap) : new LinkedHashMap<>();
                 Object text = wrap.containsKey("_text") ? wrap.get("_text") : (valueMap == null ? value : null);
                 if (text == null || String.valueOf(text).isBlank()) {
-                    if (isEffectivelyRequired(field) || hasAttrs) {
+                    if (force || isEffectivelyRequired(field) || hasAttrs) {
                         text = defaultLexicalValue(field);
                     }
                 }
@@ -534,7 +786,7 @@ public class XsdParserService {
                 return wrap;
             }
             if (value == null || String.valueOf(value).isBlank()) {
-                return isEffectivelyRequired(field) ? defaultLexicalValue(field) : value;
+                return force || isEffectivelyRequired(field) ? defaultLexicalValue(field) : value;
             }
             return value;
         }
@@ -1022,16 +1274,31 @@ public class XsdParserService {
             boolean choiceMandatory = isChoice && particle.getMinOccurs() >= 1;
 
             XSObjectList particles = group.getParticles();
+            int branchCounter = 0;
             for (int i = 0; i < particles.getLength(); i++) {
                 XSParticle childParticle = (XSParticle) particles.item(i);
                 if (isChoice) {
                     List<SchemaField> mapped = mapParticleChildren(childParticle, parentXpath, null, depth, typeStack);
-                    for (SchemaField bf : mapped) {
-                        bf.setChoiceGroup(groupId);
-                        bf.setChoiceBranch(i);
-                        bf.setChoiceMandatory(choiceMandatory);
-                        // Alternatives are mutually exclusive — don't mark all as HTML-required
-                        bf.setRequired(false);
+                    XSTerm childTerm = childParticle.getTerm();
+                    boolean nestedChoice = childTerm instanceof XSModelGroup nested
+                            && nested.getCompositor() == XSModelGroup.COMPOSITOR_CHOICE;
+                    if (nestedChoice) {
+                        // Flatten nested choice: each alternative is its own exclusive branch
+                        for (SchemaField bf : mapped) {
+                            bf.setChoiceGroup(groupId);
+                            bf.setChoiceBranch(branchCounter++);
+                            bf.setChoiceMandatory(choiceMandatory);
+                            bf.setRequired(false);
+                        }
+                    } else {
+                        // Single element or sequence: all mapped fields share one branch
+                        int branch = branchCounter++;
+                        for (SchemaField bf : mapped) {
+                            bf.setChoiceGroup(groupId);
+                            bf.setChoiceBranch(branch);
+                            bf.setChoiceMandatory(choiceMandatory);
+                            bf.setRequired(false);
+                        }
                     }
                     children.addAll(mapped);
                 } else {

@@ -6,17 +6,32 @@ Repository: [nagesh-45/ParserFileGenerator](https://github.com/nagesh-45/ParserF
 
 ## Requirements
 
-- To build from source: Java 17+ and Maven 3.8+
+- To build from source: Java 17+ (Maven is not required, use the bundled wrapper)
 - To run the packaged application: Java 17+ only
 
 ## Build and run
 
+The Maven Wrapper downloads Maven automatically on first use.
+
+Windows (Command Prompt or PowerShell):
+
+```bat
+git clone https://github.com/nagesh-45/ParserFileGenerator.git
+cd ParserFileGenerator
+mvnw.cmd clean package
+java -jar target\payment-file-creator.jar
+```
+
+macOS / Linux:
+
 ```bash
 git clone https://github.com/nagesh-45/ParserFileGenerator.git
 cd ParserFileGenerator
-mvn clean package
+./mvnw clean package
 java -jar target/payment-file-creator.jar
 ```
+
+If Maven is already installed, `mvn clean package` works too.
 
 Open [http://localhost:8080](http://localhost:8080).
 

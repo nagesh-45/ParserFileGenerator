@@ -23,6 +23,22 @@ Keep the black console window OPEN while using the app.
 To stop the app, press Ctrl+C in that window, or just close it.
 
 
+UPDATING WITH GIT PULL
+----------------------
+
+Stop the app before running "git pull", otherwise Windows keeps the jar
+locked and git reports: Unlink of file 'payment-file-creator.jar' failed.
+
+    1. Press Ctrl+C in the console window, then close it.
+    2. If needed:   taskkill /F /IM java.exe
+    3. git pull
+
+If git still refuses, force the folder to match GitHub:
+
+    git fetch origin
+    git reset --hard origin/main
+
+
 IF DOUBLE-CLICK DOES NOT WORK
 -----------------------------
 

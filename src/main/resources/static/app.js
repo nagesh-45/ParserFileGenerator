@@ -40,7 +40,9 @@
         validationErrorList: document.getElementById('validationErrorList'),
         previewSection: document.getElementById('previewSection'),
         xmlPreview: document.getElementById('xmlPreview'),
-        copyBtn: document.getElementById('copyBtn')
+        copyBtn: document.getElementById('copyBtn'),
+        expandAllTagsBtn: document.getElementById('expandAllTagsBtn'),
+        collapseAllTagsBtn: document.getElementById('collapseAllTagsBtn')
     };
 
     function on(el, event, handler) {
@@ -194,6 +196,8 @@
         if (state.mode === 'random') fillAllVisibleControls(els.dynamicForm);
         clearGeneratedResult();
     });
+    on(els.expandAllTagsBtn, 'click', () => setAllTagsExpanded(true));
+    on(els.collapseAllTagsBtn, 'click', () => setAllTagsExpanded(false));
     on(els.countryCode, 'input', () => {
         els.countryCode.value = els.countryCode.value.replace(/[^a-z]/gi, '').slice(0, 2).toUpperCase();
         updateCountryContextHint();
@@ -348,60 +352,102 @@
         if (!root) return;
 
         const wrapper = document.createElement('div');
-        wrapper.className = 'field-card bg-slate-50 rounded-xl p-4 border border-slate-200';
-        wrapper.innerHTML = `
-            <div class="flex items-center justify-between mb-3">
-                <div>
+        wrapper.className = 'field-card bg-slate-50 rounded-xl border border-slate-200 overflow-hidden';
+        wrapper.dataset.collapsibleTag = '1';
+
+        const header = document.createElement('button');
+        header.type = 'button';
+        header.className = 'tag-toggle w-full flex items-center justify-between gap-3 px-4 py-3 text-left';
+        header.setAttribute('aria-expanded', 'true');
+        header.innerHTML = `
+            <div class="flex items-start gap-2 min-w-0">
+                <span class="tag-chevron mt-1" aria-hidden="true">▼</span>
+                <div class="min-w-0">
                     <h3 class="font-semibold text-slate-900">&lt;${escapeHtml(root.name)}&gt;</h3>
-                    <p class="text-xs text-slate-500 mt-0.5">${escapeHtml(root.type || 'complex')} · ${escapeHtml(root.xpath || '')}</p>
+                    <p class="text-xs text-slate-500 mt-0.5 truncate">${escapeHtml(root.type || 'complex')} · ${escapeHtml(root.xpath || '')}</p>
                 </div>
-                ${root.required ? '<span class="text-xs text-rose-600 font-medium">required</span>' : ''}
             </div>
+            ${root.required ? '<span class="text-xs text-rose-600 font-medium shrink-0">required</span>' : ''}
         `;
 
-        const childrenHost = document.createElement('div');
-        childrenHost.className = 'space-y-3';
-        childrenHost.dataset.path = root.name;
+        const body = document.createElement('div');
+        body.className = 'tag-body space-y-3 px-4 pb-4';
+        body.dataset.path = root.name;
 
         if (root.complex && root.children && root.children.length) {
-            root.children.forEach(child => childrenHost.appendChild(renderField(child, root.name)));
+            root.children.forEach(child => body.appendChild(renderField(child, root.name, 1)));
         } else {
-            childrenHost.appendChild(renderSimpleInput(root, root.name, true));
+            body.appendChild(renderSimpleInput(root, root.name, true));
         }
 
-        wrapper.appendChild(childrenHost);
+        header.addEventListener('click', () => toggleTagSection(wrapper, header, body));
+        wrapper.appendChild(header);
+        wrapper.appendChild(body);
         els.dynamicForm.appendChild(wrapper);
         applyOptionalTagVisibility();
         applyCountryContextToForm();
         applyPaymentContextToForm();
     }
 
-    function renderField(field, parentPath) {
+    function toggleTagSection(card, header, body, forceExpand) {
+        const expand = forceExpand != null
+            ? forceExpand
+            : header.getAttribute('aria-expanded') !== 'true';
+        header.setAttribute('aria-expanded', expand ? 'true' : 'false');
+        header.classList.toggle('tag-collapsed', !expand);
+        if (expand) body.removeAttribute('hidden');
+        else body.setAttribute('hidden', '');
+    }
+
+    function setAllTagsExpanded(expand) {
+        els.dynamicForm.querySelectorAll('[data-collapsible-tag="1"]').forEach(card => {
+            const header = card.querySelector(':scope > .tag-toggle');
+            const body = card.querySelector(':scope > .tag-body');
+            if (header && body) toggleTagSection(card, header, body, expand);
+        });
+    }
+
+    function renderField(field, parentPath, depth) {
         const path = parentPath + '.' + field.name;
+        const nestDepth = depth == null ? 1 : depth;
         const container = document.createElement('div');
         container.dataset.optionalTag = (!field.required && !field.choiceGroup) ? '1' : '0';
 
         if (field.complex) {
-            container.className = 'nested-card bg-white rounded-lg p-4 border border-slate-200';
+            container.className = 'nested-card bg-white rounded-lg border border-slate-200 overflow-hidden';
+            container.dataset.collapsibleTag = '1';
             if (field.choiceGroup) {
                 container.dataset.choiceGroup = field.choiceGroup;
                 container.dataset.choiceBranch = field.choiceBranch == null ? '0' : String(field.choiceBranch);
             }
-            const header = document.createElement('div');
-            header.className = 'flex items-center justify-between mb-3';
+
+            // Deep / optional branches start collapsed to keep pacs forms usable
+            const startExpanded = nestDepth <= 1 || !!field.required;
+
+            const header = document.createElement('button');
+            header.type = 'button';
+            header.className = 'tag-toggle w-full flex items-center justify-between gap-3 px-3 py-2.5 text-left'
+                + (startExpanded ? '' : ' tag-collapsed');
+            header.setAttribute('aria-expanded', startExpanded ? 'true' : 'false');
             header.innerHTML = `
-                <div>
-                    <p class="font-medium text-slate-800">&lt;${escapeHtml(field.name)}&gt;${field.choiceGroup ? ' <span class="text-[10px] text-amber-700 font-normal">(choice)</span>' : ''}</p>
-                    <p class="text-xs text-slate-500">${escapeHtml(field.type || 'complex')}${field.documentation ? ' · ' + escapeHtml(field.documentation) : ''}</p>
+                <div class="flex items-start gap-2 min-w-0">
+                    <span class="tag-chevron mt-0.5" aria-hidden="true">▼</span>
+                    <div class="min-w-0">
+                        <p class="font-medium text-slate-800">&lt;${escapeHtml(field.name)}&gt;${field.choiceGroup ? ' <span class="text-[10px] text-amber-700 font-normal">(choice)</span>' : ''}</p>
+                        <p class="text-xs text-slate-500 truncate">${escapeHtml(field.type || 'complex')}${field.documentation ? ' · ' + escapeHtml(field.documentation) : ''}</p>
+                    </div>
                 </div>
-                <div class="flex items-center gap-2">
+                <div class="flex items-center gap-2 shrink-0">
                     ${field.required ? '<span class="text-xs text-rose-600">*</span>' : '<span class="text-xs text-slate-400">optional</span>'}
                     ${field.repeatable || field.maxOccurs === -1 || field.maxOccurs > 1
                         ? `<span class="text-[10px] uppercase tracking-wide bg-slate-100 text-slate-600 px-2 py-0.5 rounded">max ${field.maxOccurs === -1 ? '∞' : field.maxOccurs}</span>`
                         : ''}
                 </div>
             `;
-            container.appendChild(header);
+
+            const body = document.createElement('div');
+            body.className = 'tag-body space-y-3 px-3 pb-3';
+            if (!startExpanded) body.setAttribute('hidden', '');
 
             const instancesHost = document.createElement('div');
             instancesHost.className = 'space-y-3';
@@ -412,19 +458,20 @@
                 const instance = document.createElement('div');
                 instance.className = 'space-y-3 pl-1 border-l-2 border-slate-100';
                 instance.dataset.instance = 'true';
-                (field.children || []).forEach(child => instance.appendChild(renderField(child, path)));
+                (field.children || []).forEach(child => instance.appendChild(renderField(child, path, nestDepth + 1)));
                 instancesHost.appendChild(instance);
             };
 
             addInstance();
-            container.appendChild(instancesHost);
+            body.appendChild(instancesHost);
 
             if (field.repeatable || field.maxOccurs === -1 || field.maxOccurs > 1) {
                 const addBtn = document.createElement('button');
                 addBtn.type = 'button';
-                addBtn.className = 'mt-3 text-xs text-accentDark hover:underline';
+                addBtn.className = 'mt-1 text-xs text-accentDark hover:underline';
                 addBtn.textContent = `+ Add another <${field.name}>`;
-                addBtn.addEventListener('click', () => {
+                addBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
                     const max = field.maxOccurs === -1 ? Infinity : field.maxOccurs;
                     const count = instancesHost.querySelectorAll('[data-instance="true"]').length;
                     if (count >= max) {
@@ -432,9 +479,15 @@
                         return;
                     }
                     addInstance();
+                    // Ensure the section is open when adding
+                    toggleTagSection(container, header, body, true);
                 });
-                container.appendChild(addBtn);
+                body.appendChild(addBtn);
             }
+
+            header.addEventListener('click', () => toggleTagSection(container, header, body));
+            container.appendChild(header);
+            container.appendChild(body);
         } else {
             container.appendChild(renderSimpleInput(field, path, false));
         }
@@ -1470,7 +1523,7 @@
             const instance = document.createElement('div');
             instance.className = 'space-y-3 pl-1 border-l-2 border-slate-100';
             instance.dataset.instance = 'true';
-            (field.children || []).forEach(child => instance.appendChild(renderField(child, path)));
+            (field.children || []).forEach(child => instance.appendChild(renderField(child, path, 2)));
             host.appendChild(instance);
         }
     }

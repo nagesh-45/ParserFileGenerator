@@ -47,6 +47,27 @@
         .nested-card {
             border-left: 3px solid #64748b;
         }
+        .tag-toggle {
+            cursor: pointer;
+            user-select: none;
+        }
+        .tag-toggle:hover {
+            background-color: rgba(148, 163, 184, 0.12);
+        }
+        .tag-chevron {
+            display: inline-block;
+            transition: transform 0.15s ease;
+            font-size: 0.7rem;
+            color: #64748b;
+            width: 1rem;
+            text-align: center;
+        }
+        .tag-collapsed > .tag-chevron {
+            transform: rotate(-90deg);
+        }
+        .tag-body[hidden] {
+            display: none !important;
+        }
     </style>
 </head>
 <body class="text-ink font-sans">
@@ -123,8 +144,18 @@
             </button>
         </div>
 
-        <div id="manualHint" class="mb-4 text-sm text-slate-500">
-            Fields marked with <span class="text-rose-600">*</span> are required (<code>minOccurs &gt;= 1</code>).
+        <div id="manualHint" class="mb-4 flex flex-wrap items-center justify-between gap-3 text-sm text-slate-500">
+            <p>Fields marked with <span class="text-rose-600">*</span> are required (<code>minOccurs &gt;= 1</code>). Click a tag name to expand or collapse it.</p>
+            <div class="flex items-center gap-2">
+                <button type="button" id="expandAllTagsBtn"
+                        class="text-xs font-medium text-sky-700 hover:text-sky-900 border border-sky-200 bg-sky-50 px-2.5 py-1 rounded-lg">
+                    Expand all
+                </button>
+                <button type="button" id="collapseAllTagsBtn"
+                        class="text-xs font-medium text-slate-600 hover:text-slate-900 border border-slate-200 bg-white px-2.5 py-1 rounded-lg">
+                    Collapse all
+                </button>
+            </div>
         </div>
         <div id="randomHint" class="hidden mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
             Random mode will fill the form with valid sample values. You can still edit any field before generating XML.
@@ -211,6 +242,6 @@
     </section>
 </main>
 
-<script src="/app.js?v=2026-07-25h"></script>
+<script src="/app.js?v=2026-07-25h-collapse"></script>
 </body>
 </html>

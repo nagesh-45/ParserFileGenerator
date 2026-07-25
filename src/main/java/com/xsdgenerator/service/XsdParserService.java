@@ -219,12 +219,26 @@ public class XsdParserService {
     public String generateAndValidateXml(String schemaId, SchemaField clientSchema, Map<String, Object> values) {
         StoredSchema stored = requireStoredSchema(schemaId);
         SchemaField rootSchema = ensureMaterializedRoot(schemaId, stored, resolveRootSchema(stored, clientSchema));
+        rootSchema = ensureIsoMessageChild(schemaId, stored, rootSchema);
         Map<String, Object> enriched = enrichValuesForGeneration(rootSchema, values);
         String xml = generateXml(rootSchema, enriched);
 
         List<String> errors = collectValidationErrors(xml, stored);
-        // Re-read store in case rematerialize/graft updated roots
         stored = requireStoredSchema(schemaId);
+
+        // Empty <Document/> against pacs.008 — rebuild the tree and fill from scratch once
+        if (!errors.isEmpty() && isMissingDocumentMessage(errors)) {
+            log.warn("Document missing FIToFICstmrCdtTrf — forcing schema rematerialize and refill");
+            rootSchema = forceRematerializeRoot(schemaId, stored, rootSchema);
+            rootSchema = ensureIsoMessageChild(schemaId, stored, rootSchema);
+            Map<String, Object> fresh = new LinkedHashMap<>();
+            fresh.put(rootSchema.getName(), new LinkedHashMap<>());
+            enriched = enrichValuesForGeneration(rootSchema, fresh);
+            xml = generateXml(rootSchema, enriched);
+            errors = collectValidationErrors(xml, stored);
+            stored = requireStoredSchema(schemaId);
+        }
+
         for (int attempt = 0; !errors.isEmpty() && attempt < MAX_REPAIR_ATTEMPTS; attempt++) {
             Object repaired = repairOnce(stored, rootSchema, enriched.get(rootSchema.getName()), errors);
             if (repaired == null) {
@@ -241,6 +255,217 @@ public class XsdParserService {
                     errors);
         }
         return xml;
+    }
+
+    private boolean isMissingDocumentMessage(List<String> errors) {
+        Set<String> expected = matchedElementNames(errors, EXPECTED_CONTENT);
+        return expected.contains("FIToFICstmrCdtTrf")
+                || expected.stream().anyMatch(n -> n != null && n.contains("CstmrCdtTrf"));
+    }
+
+    /**
+     * Always re-parse the root from XSD bytes (used when Document was emitted empty).
+     */
+    private SchemaField forceRematerializeRoot(String schemaId, StoredSchema stored, SchemaField root) {
+        try {
+            List<SchemaField> refreshed = parseXsd(stored.bytes(), stored.fileName(), stored.files());
+            SchemaField replacement = null;
+            for (SchemaField candidate : refreshed) {
+                if (root.getName() != null && root.getName().equals(candidate.getName())) {
+                    replacement = candidate;
+                    break;
+                }
+            }
+            if (replacement == null && !refreshed.isEmpty()) {
+                replacement = refreshed.get(0);
+            }
+            if (replacement != null) {
+                List<SchemaField> updated = new ArrayList<>();
+                boolean replaced = false;
+                for (SchemaField existing : stored.roots()) {
+                    if (existing.getName() != null && existing.getName().equals(replacement.getName())) {
+                        updated.add(replacement);
+                        replaced = true;
+                    } else {
+                        updated.add(existing);
+                    }
+                }
+                if (!replaced) {
+                    updated.add(0, replacement);
+                }
+                schemaStore.put(schemaId,
+                        new StoredSchema(stored.fileName(), stored.bytes(), stored.files(), updated));
+                log.info("Force-rematerialized root '{}' children={}",
+                        replacement.getName(),
+                        replacement.getChildren() != null ? replacement.getChildren().size() : 0);
+                return replacement;
+            }
+        } catch (Exception ex) {
+            log.warn("Force rematerialize failed: {}", ex.getMessage());
+        }
+        return root;
+    }
+
+    /**
+     * Guarantees Document has FIToFICstmrCdtTrf (or similar) when the XSD namespace is pacs.008,
+     * even if the initial XSModel walk left Document with zero children.
+     */
+    private SchemaField ensureIsoMessageChild(String schemaId, StoredSchema stored, SchemaField root) {
+        if (root == null || !"Document".equals(root.getName())) {
+            return root;
+        }
+        boolean hasMessage = root.getChildren() != null && root.getChildren().stream()
+                .anyMatch(c -> c.getName() != null && c.getName().contains("CstmrCdtTrf"));
+        if (hasMessage) {
+            return root;
+        }
+
+        String ns = root.getNamespace();
+        if (ns == null) {
+            ns = "";
+        }
+        // Try loading model and remapping Document from the live element declaration
+        try {
+            XSModel model = loadSchemaModel(stored.bytes(), stored.fileName(), stored.files());
+            XSElementDeclaration doc = model.getElementDeclaration("Document", ns.isBlank() ? null : ns);
+            if (doc == null && model.getComponents(XSConstants.ELEMENT_DECLARATION) != null) {
+                XSNamedMap elements = model.getComponents(XSConstants.ELEMENT_DECLARATION);
+                for (int i = 0; i < elements.getLength(); i++) {
+                    XSElementDeclaration el = (XSElementDeclaration) elements.item(i);
+                    if ("Document".equals(el.getName())) {
+                        doc = el;
+                        break;
+                    }
+                }
+            }
+            if (doc != null) {
+                SchemaField remapped = mapElement(
+                        doc, "/Document", 1, 1, 0, Collections.newSetFromMap(new IdentityHashMap<>()));
+                if (remapped.getChildren() != null && !remapped.getChildren().isEmpty()) {
+                    replaceStoredRoot(schemaId, stored, remapped);
+                    log.info("ISO Document remapped with {} children via XSModel", remapped.getChildren().size());
+                    return remapped;
+                }
+            }
+
+            // Fallback: read message element name + type from raw XSD text and map that type
+            String[] message = findDocumentMessageElement(stored.bytes());
+            if (message != null) {
+                String elName = message[0];
+                String typeName = message[1];
+                String typeNs = ns.isBlank() ? null : ns;
+                XSTypeDefinition typeDef = model.getTypeDefinition(typeName, typeNs);
+                SchemaField messageField = new SchemaField();
+                messageField.setName(elName);
+                messageField.setNamespace(ns.isBlank() ? null : ns);
+                messageField.setRequired(true);
+                messageField.setMinOccurs(1);
+                messageField.setMaxOccurs(1);
+                messageField.setComplex(true);
+                messageField.setXpath("/Document/" + elName);
+                if (typeDef instanceof XSComplexTypeDefinition complex) {
+                    messageField.setTypeName(resolveTypeName(typeDef));
+                    messageField.setType(resolveTypeName(typeDef));
+                    messageField.getAttributes().addAll(mapAttributes(complex));
+                    XSParticle particle = complex.getParticle();
+                    if (particle != null) {
+                        Set<XSTypeDefinition> stack = Collections.newSetFromMap(new IdentityHashMap<>());
+                        stack.add(typeDef);
+                        messageField.getChildren().addAll(
+                                mapParticleChildren(particle, messageField.getXpath(), null, 1, stack));
+                    }
+                }
+                if (root.getChildren() == null) {
+                    // SchemaField should init children list — ensure mutable
+                }
+                root.getChildren().clear();
+                root.getChildren().add(messageField);
+                root.setComplex(true);
+                replaceStoredRoot(schemaId, stored, root);
+                log.info("Injected Document message child '{}' from XSD text (type={})", elName, typeName);
+                return root;
+            }
+        } catch (Exception ex) {
+            log.warn("ensureIsoMessageChild failed: {}", ex.getMessage());
+        }
+
+        // Last resort: synthetic required shell so repair/enrich at least emits the element
+        SchemaField shell = new SchemaField();
+        shell.setName("FIToFICstmrCdtTrf");
+        shell.setNamespace(ns.isBlank() ? null : ns);
+        shell.setComplex(true);
+        shell.setRequired(true);
+        shell.setMinOccurs(1);
+        shell.setMaxOccurs(1);
+        shell.setType("FIToFICustomerCreditTransfer");
+        shell.setXpath("/Document/FIToFICstmrCdtTrf");
+        root.getChildren().add(shell);
+        root.setComplex(true);
+        log.warn("Injected synthetic FIToFICstmrCdtTrf shell under Document");
+        return root;
+    }
+
+    private void replaceStoredRoot(String schemaId, StoredSchema stored, SchemaField replacement) {
+        List<SchemaField> updated = new ArrayList<>();
+        boolean replaced = false;
+        for (SchemaField existing : stored.roots()) {
+            if (existing.getName() != null && existing.getName().equals(replacement.getName())) {
+                updated.add(replacement);
+                replaced = true;
+            } else {
+                updated.add(existing);
+            }
+        }
+        if (!replaced) {
+            updated.add(0, replacement);
+        }
+        schemaStore.put(schemaId, new StoredSchema(stored.fileName(), stored.bytes(), stored.files(), updated));
+    }
+
+    /**
+     * @return {{@code elementName, typeName}} for Document's message child, or null
+     */
+    private String[] findDocumentMessageElement(byte[] xsdBytes) {
+        if (xsdBytes == null) {
+            return null;
+        }
+        String xsd = new String(xsdBytes, StandardCharsets.UTF_8);
+        Matcher docType = Pattern.compile(
+                "<xs:complexType\\s+name\\s*=\\s*\"Document\"[^>]*>(.*?)</xs:complexType>",
+                Pattern.DOTALL | Pattern.CASE_INSENSITIVE).matcher(xsd);
+        if (!docType.find()) {
+            // anonymous Document type inline
+            docType = Pattern.compile(
+                    "<xs:element\\s+name\\s*=\\s*\"Document\"[^>]*>\\s*<xs:complexType>(.*?)</xs:complexType>",
+                    Pattern.DOTALL | Pattern.CASE_INSENSITIVE).matcher(xsd);
+            if (!docType.find()) {
+                return null;
+            }
+        }
+        String body = docType.group(1);
+        Matcher el = Pattern.compile(
+                "<xs:element[^>]*name\\s*=\\s*\"([^\"]+)\"[^>]*type\\s*=\\s*\"([^\"]+)\"[^>]*/?>",
+                Pattern.CASE_INSENSITIVE).matcher(body);
+        if (el.find()) {
+            String type = el.group(2);
+            int colon = type.indexOf(':');
+            if (colon >= 0) {
+                type = type.substring(colon + 1);
+            }
+            return new String[]{el.group(1), type};
+        }
+        el = Pattern.compile(
+                "<xs:element[^>]*type\\s*=\\s*\"([^\"]+)\"[^>]*name\\s*=\\s*\"([^\"]+)\"[^>]*/?>",
+                Pattern.CASE_INSENSITIVE).matcher(body);
+        if (el.find()) {
+            String type = el.group(1);
+            int colon = type.indexOf(':');
+            if (colon >= 0) {
+                type = type.substring(colon + 1);
+            }
+            return new String[]{el.group(2), type};
+        }
+        return null;
     }
 
     /**
@@ -1560,9 +1785,8 @@ public class XsdParserService {
         public LSInput resolveResource(String type, String namespaceURI, String publicId,
                                        String systemId, String baseURI) {
             byte[] data = find(systemId);
-            if (data == null && primaryName != null) {
-                data = find(primaryName);
-            }
+            // Do NOT fall back to the primary schema — that masquerades missing imports as success
+            // and leaves Document with an empty content model while validation may still see types.
             if (data == null) {
                 return null;
             }

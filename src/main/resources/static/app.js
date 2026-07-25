@@ -145,7 +145,21 @@
 
             els.fileBadge.textContent = state.fileName;
             els.fileBadge.classList.remove('hidden');
-            setStatus(els.uploadStatus, `Parsed ${state.roots.length} root element(s) from ${state.fileName}. Ready for validated generation.`, false);
+            const childNames = Array.isArray(data.documentChildNames) ? data.documentChildNames.join(', ') : '';
+            const childInfo = data.documentChildCount != null
+                ? ` Document children: ${data.documentChildCount}${childNames ? ' (' + childNames + ')' : ''}.`
+                : '';
+            const buildInfo = data.buildId ? ` [${data.buildId}]` : '';
+            setStatus(els.uploadStatus,
+                `Parsed ${state.roots.length} root element(s) from ${state.fileName}.${childInfo}${buildInfo}`,
+                false);
+            if (data.documentChildCount === 0) {
+                setStatus(els.uploadStatus,
+                    `Warning: Document has 0 child elements — schema types may not have loaded. `
+                    + `Upload the full single-file pacs.008.001.05.xsd or a ZIP of the XSD plus its imports. `
+                    + `[${data.buildId || 'unknown'}]`,
+                    true);
+            }
             renderRootSelector();
             renderForm();
             setMode('manual');

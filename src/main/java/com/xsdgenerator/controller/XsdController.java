@@ -77,6 +77,19 @@ public class XsdController {
             response.put("fileName", parsed.fileName());
             response.put("roots", parsed.roots());
             response.put("rootCount", parsed.roots().size());
+            response.put("buildId", "2026-07-25d");
+            if (!parsed.roots().isEmpty()) {
+                var doc = parsed.roots().stream()
+                        .filter(r -> "Document".equals(r.getName()))
+                        .findFirst()
+                        .orElse(parsed.roots().get(0));
+                response.put("rootName", doc.getName());
+                response.put("documentChildCount",
+                        doc.getChildren() != null ? doc.getChildren().size() : 0);
+                response.put("documentChildNames",
+                        doc.getChildren() == null ? java.util.List.of()
+                                : doc.getChildren().stream().map(c -> c.getName()).toList());
+            }
             return ResponseEntity.ok(response);
         } catch (IllegalArgumentException ex) {
             return ResponseEntity.badRequest().body(error(ex.getMessage()));
